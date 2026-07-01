@@ -9,43 +9,137 @@
   <Navbar></Navbar>
   <div id="content" class="container">
     <h1 class="my-4">{{ $t('troubleshooting.troubleshooting') }}</h1>
-    <!-- ViGEmBus Installation -->
+    <!-- Virtual gamepad -->
     <div class="card my-4" v-if="platform === 'windows' && controllerEnabled">
       <div class="card-body">
-        <h2 id="vigembus">{{ $t('troubleshooting.vigembus_install') }}</h2>
-        <p style="white-space: pre-line">{{ $t('troubleshooting.vigembus_desc') }}</p>
-        <div v-if="vigembus.installed && vigembus.version">
-          <p><strong>{{ $t('troubleshooting.vigembus_current_version') }}:</strong> {{ vigembus.version }}</p>
-          <div class="alert alert-success" v-if="vigembus.version_compatible">
-            <check-circle :size="18" class="icon"></check-circle>
-            {{ $t('troubleshooting.vigembus_compatible') }}
-          </div>
-          <div class="alert alert-danger" v-if="!vigembus.version_compatible">
-            <alert-circle :size="18" class="icon"></alert-circle>
-            {{ $t('troubleshooting.vigembus_incompatible') }}
-          </div>
+        <h2 id="virtualhid">{{ $t('troubleshooting.virtual_gamepad') }}</h2>
+        <p style="white-space: pre-line">{{ $t('troubleshooting.virtual_gamepad_desc') }}</p>
+        <div class="table-responsive">
+          <table class="table align-middle mb-0">
+            <thead>
+              <tr>
+                <th scope="col">{{ $t('troubleshooting.driver_name') }}</th>
+                <th scope="col">{{ $t('troubleshooting.driver_installed_version') }}</th>
+                <th scope="col">{{ $t('troubleshooting.driver_supported_versions') }}</th>
+                <th scope="col">{{ $t('troubleshooting.driver_status') }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <th scope="row">{{ $t('troubleshooting.virtualhid_driver') }}</th>
+                <td>{{ driverVersion(virtualhid) }}</td>
+                <td>{{ virtualhid.supported_versions }}</td>
+                <td>
+                  <span :class="driverStatusClass(virtualhid)">
+                    {{ driverStatusText(virtualhid) }}
+                  </span>
+                </td>
+              </tr>
+              <tr id="vigembus">
+                <th scope="row">{{ $t('troubleshooting.vigembus_driver') }}</th>
+                <td>{{ driverVersion(vigembus) }}</td>
+                <td>{{ vigembus.supported_versions }}</td>
+                <td>
+                  <span :class="driverStatusClass(vigembus)">
+                    {{ driverStatusText(vigembus) }}
+                  </span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </div>
-        <div class="alert alert-warning" v-else-if="!vigembus.installed">
-          <alert-triangle :size="18" class="icon"></alert-triangle>
-          {{ $t('troubleshooting.vigembus_not_installed') }}
-        </div>
-        <div class="alert alert-success" v-if="vigemBusInstallStatus === true">
-          <check-circle :size="18" class="icon"></check-circle>
-          {{ $t('troubleshooting.vigembus_install_success') }}
-        </div>
-        <div class="alert alert-danger" v-if="vigemBusInstallStatus === false">
+      </div>
+    </div>
+    <!-- Virtual HID license -->
+    <div class="card my-4" v-if="platform === 'windows'">
+      <div class="card-body">
+        <h2 id="virtualhid-license">{{ $t('troubleshooting.virtualhid_license') }}</h2>
+        <p>{{ $t('troubleshooting.virtualhid_license_desc') }}</p>
+
+        <div class="alert alert-danger" role="alert" v-if="licenseError">
           <alert-circle :size="18" class="icon"></alert-circle>
-          {{ vigemBusInstallError || $t('troubleshooting.vigembus_install_error') }}
+          {{ licenseError }}
         </div>
-        <div>
-          <button
-            :class="vigembus.installed && vigembus.version === vigembus.packaged_version ? 'btn btn-danger' : 'btn btn-primary'"
-            :disabled="vigemBusInstallPressed"
-            @click="installViGEmBus">
-            <download :size="18" class="icon" v-if="!(vigembus.installed && vigembus.version === vigembus.packaged_version)"></download>
-            <refresh-cw :size="18" class="icon" v-else></refresh-cw>
-            {{ vigembus.installed && vigembus.version === vigembus.packaged_version ? $t('troubleshooting.vigembus_force_reinstall_button', { version: vigembus.packaged_version }) : $t('troubleshooting.vigembus_install_button', { version: vigembus.packaged_version }) }}
+        <div class="alert alert-warning" role="alert" v-else-if="!virtualhidLicense.service_available">
+          <alert-triangle :size="18" class="icon"></alert-triangle>
+          {{ virtualhidLicense.message || $t('troubleshooting.virtualhid_license_unavailable') }}
+        </div>
+
+        <dl class="row mb-3">
+          <dt class="col-sm-4">{{ $t('troubleshooting.virtualhid_license_state') }}</dt>
+          <dd class="col-sm-8">
+            <span :class="licenseStatusClass()">{{ licenseStatusText() }}</span>
+          </dd>
+          <template v-if="virtualhidLicense.plan_name">
+            <dt class="col-sm-4">{{ $t('troubleshooting.virtualhid_license_plan') }}</dt>
+            <dd class="col-sm-8">{{ virtualhidLicense.plan_name }}</dd>
+          </template>
+          <template v-if="virtualhidLicense.customer_email">
+            <dt class="col-sm-4">{{ $t('troubleshooting.virtualhid_license_customer') }}</dt>
+            <dd class="col-sm-8">{{ virtualhidLicense.customer_email }}</dd>
+          </template>
+          <template v-if="virtualhidLicense.expires_at">
+            <dt class="col-sm-4">{{ $t('troubleshooting.virtualhid_license_expires') }}</dt>
+            <dd class="col-sm-8">{{ virtualhidLicense.expires_at }}</dd>
+          </template>
+          <dt class="col-sm-4">{{ $t('troubleshooting.virtualhid_license_activations') }}</dt>
+          <dd class="col-sm-8">{{ licenseActivationText() }}</dd>
+          <dt class="col-sm-4">{{ $t('troubleshooting.virtualhid_license_active_devices') }}</dt>
+          <dd class="col-sm-8">{{ virtualhidLicense.active_devices }}</dd>
+        </dl>
+
+        <p class="text-body-secondary" v-if="virtualhidLicense.message && virtualhidLicense.service_available">
+          {{ virtualhidLicense.message }}
+        </p>
+
+        <div class="mb-3">
+          <label for="virtualhid-license-key" class="form-label">
+            {{ $t('troubleshooting.virtualhid_license_key') }}
+          </label>
+          <input id="virtualhid-license-key"
+                 class="form-control"
+                 type="password"
+                 v-model="licenseKey"
+                 :placeholder="$t('troubleshooting.virtualhid_license_key_placeholder')"
+                 :disabled="licenseBusy"
+                 autocomplete="off"
+                 autocapitalize="off"
+                 spellcheck="false"
+                 @keyup.enter="updateLicense('activate')" />
+          <div class="form-text">{{ $t('troubleshooting.virtualhid_license_key_desc') }}</div>
+        </div>
+
+        <div class="d-flex flex-wrap gap-2">
+          <button class="btn btn-primary"
+                  :disabled="licenseBusy || !virtualhidLicense.service_available || !licenseKey.trim()"
+                  @click="updateLicense('activate')">
+            {{ $t('troubleshooting.virtualhid_license_activate') }}
           </button>
+          <button class="btn btn-secondary"
+                  :disabled="licenseBusy || !virtualhidLicense.service_available"
+                  @click="updateLicense('validate')">
+            <refresh-cw :size="18" class="icon"></refresh-cw>
+            {{ $t('troubleshooting.virtualhid_license_refresh') }}
+          </button>
+          <button class="btn btn-outline-danger"
+                  :disabled="licenseBusy || !virtualhidLicense.service_available || virtualhidLicense.state === 'unlicensed'"
+                  @click="updateLicense('deactivate')">
+            {{ $t('troubleshooting.virtualhid_license_deactivate') }}
+          </button>
+          <a class="btn btn-success"
+             v-if="virtualhidLicense.purchase_url"
+             :href="virtualhidLicense.purchase_url"
+             target="_blank"
+             rel="noopener noreferrer">
+            {{ $t('troubleshooting.virtualhid_license_buy') }}
+          </a>
+          <a class="btn btn-outline-primary"
+             v-if="virtualhidLicense.manage_account_url"
+             :href="virtualhidLicense.manage_account_url"
+             target="_blank"
+             rel="noopener noreferrer">
+            {{ $t('troubleshooting.virtualhid_license_manage') }}
+          </a>
         </div>
       </div>
     </div>
@@ -213,7 +307,6 @@
       ChevronsDown,
       ChevronsUp,
       Copy,
-      Download,
       RefreshCw,
       RotateCcw,
       Search,
@@ -233,7 +326,6 @@
         ChevronsDown,
         ChevronsUp,
         Copy,
-        Download,
         RefreshCw,
         RotateCcw,
         Search,
@@ -251,21 +343,44 @@
           logs: 'Loading...',
           logFilter: null,
           logInterval: null,
+          licenseBusy: false,
+          licenseError: '',
+          licenseKey: '',
           restartPressed: false,
           showApplyMessage: false,
           platform: "",
           controllerEnabled: false,
           unpairAllPressed: false,
           unpairAllStatus: null,
+          virtualhid: {
+            installed: false,
+            version: '',
+            version_compatible: false,
+            minimum_version: '',
+            supported_versions: '',
+          },
+          virtualhidLicense: {
+            operation_ok: false,
+            service_available: false,
+            state: 'unavailable',
+            licensed: false,
+            active_devices: 0,
+            activation_limit: 0,
+            activation_usage: 0,
+            plan_name: '',
+            customer_email: '',
+            expires_at: '',
+            message: '',
+            purchase_url: '',
+            manage_account_url: '',
+          },
           vigembus: {
             installed: false,
             version: '',
             version_compatible: false,
-            packaged_version: '',
+            minimum_version: '',
+            supported_versions: '',
           },
-          vigemBusInstallPressed: false,
-          vigemBusInstallStatus: null,
-          vigemBusInstallError: null,
           currentLogIndex: -1,
           logLines: [],
         };
@@ -395,9 +510,12 @@
           .then((r) => {
             this.platform = r.platform;
             this.controllerEnabled = r.controller !== "disabled";
-            // Fetch ViGEmBus status only on Windows when gamepad is enabled
+            // Fetch virtual input driver status only on Windows when gamepad is enabled
             if (this.platform === 'windows' && this.controllerEnabled) {
-              this.refreshViGEmBusStatus();
+              this.refreshVirtualInputStatus();
+            }
+            if (this.platform === 'windows') {
+              this.refreshLicenseStatus();
             }
           });
 
@@ -538,54 +656,132 @@
               }, 5000);
             });
         },
-        refreshViGEmBusStatus() {
-          fetch("/api/vigembus/status")
+        refreshVirtualInputStatus() {
+          fetch("/api/virtual-input/status")
             .then((r) => r.json())
             .then((r) => {
+              const virtualhid = r.virtualhid || {};
+              const vigembus = r.vigembus || {};
+              this.virtualhid = {
+                installed: virtualhid.installed || false,
+                version: virtualhid.version || '',
+                version_compatible: virtualhid.version_compatible || false,
+                minimum_version: virtualhid.minimum_version || '',
+                supported_versions: virtualhid.supported_versions || '',
+              };
               this.vigembus = {
-                installed: r.installed || false,
-                version: r.version || '',
-                version_compatible: r.version_compatible || false,
-                packaged_version: r.packaged_version,
+                installed: vigembus.installed || false,
+                version: vigembus.version || '',
+                version_compatible: vigembus.version_compatible || false,
+                minimum_version: vigembus.minimum_version || '',
+                supported_versions: vigembus.supported_versions || '',
               };
             })
             .catch((err) => {
-              console.error("Failed to fetch ViGEmBus status:", err);
+              console.error("Failed to fetch virtual input driver status:", err);
             });
         },
-        installViGEmBus() {
-          this.vigemBusInstallPressed = true;
-          this.vigemBusInstallStatus = null;
-          this.vigemBusInstallError = null;
-          apiFetch("/api/vigembus/install", {
+        applyLicenseStatus(status) {
+          this.virtualhidLicense = {
+            ...this.virtualhidLicense,
+            ...status,
+          };
+          this.licenseError = status.error || '';
+        },
+        refreshLicenseStatus() {
+          this.licenseBusy = true;
+          this.licenseError = '';
+          fetch("/api/virtual-input/license")
+            .then(async (response) => {
+              const status = await response.json();
+              if (!response.ok) {
+                throw new Error(status.error || this.$t('troubleshooting.virtualhid_license_request_failed'));
+              }
+              this.applyLicenseStatus(status);
+            })
+            .catch((error) => {
+              this.licenseError = error.message;
+            })
+            .finally(() => {
+              this.licenseBusy = false;
+            });
+        },
+        updateLicense(action) {
+          if (this.licenseBusy || (action === 'activate' && !this.licenseKey.trim())) {
+            return;
+          }
+
+          this.licenseBusy = true;
+          this.licenseError = '';
+          const body = { action };
+          if (action === 'activate') {
+            body.license_key = this.licenseKey.trim();
+          }
+
+          apiFetch("/api/virtual-input/license", {
             method: "POST",
             headers: {
-              "Content-Type": "application/json"
-            }
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(body),
           })
-            .then((r) => r.json())
-            .then((r) => {
-              this.vigemBusInstallPressed = false;
-              this.vigemBusInstallStatus = r.status;
-              if (!r.status && r.error) {
-                this.vigemBusInstallError = r.error;
+            .then(async (response) => {
+              const status = await response.json();
+              if (!response.ok) {
+                throw new Error(status.error || this.$t('troubleshooting.virtualhid_license_request_failed'));
               }
-              setTimeout(() => {
-                this.vigemBusInstallStatus = null;
-                this.vigemBusInstallError = null;
-              }, 10000);
-              // Refresh status after installation attempt
-              this.refreshViGEmBusStatus();
+              this.applyLicenseStatus(status);
+              if (action === 'activate' && status.operation_ok) {
+                this.licenseKey = '';
+              }
             })
-            .catch((err) => {
-              this.vigemBusInstallPressed = false;
-              this.vigemBusInstallStatus = false;
-              this.vigemBusInstallError = err.message;
-              setTimeout(() => {
-                this.vigemBusInstallStatus = null;
-                this.vigemBusInstallError = null;
-              }, 10000);
+            .catch((error) => {
+              this.licenseError = error.message;
+            })
+            .finally(() => {
+              body.license_key = '';
+              this.licenseBusy = false;
             });
+        },
+        licenseStatusClass() {
+          if (this.virtualhidLicense.state === 'licensed') {
+            return 'badge text-bg-success';
+          }
+          if (['expired', 'disabled', 'invalid'].includes(this.virtualhidLicense.state)) {
+            return 'badge text-bg-danger';
+          }
+          return 'badge text-bg-secondary';
+        },
+        licenseStatusText() {
+          const key = `troubleshooting.virtualhid_license_state_${this.virtualhidLicense.state}`;
+          return this.$t(key);
+        },
+        licenseActivationText() {
+          if (!this.virtualhidLicense.activation_limit) {
+            return this.$t('troubleshooting.virtualhid_license_not_reported');
+          }
+          return `${this.virtualhidLicense.activation_usage} / ${this.virtualhidLicense.activation_limit}`;
+        },
+        driverVersion(driver) {
+          if (!driver.installed) {
+            return this.$t('troubleshooting.driver_not_installed');
+          }
+          return driver.version || this.$t('troubleshooting.driver_version_unknown');
+        },
+        driverStatusClass(driver) {
+          if (!driver.installed) {
+            return 'badge text-bg-secondary';
+          }
+          return driver.version_compatible ? 'badge text-bg-success' : 'badge text-bg-danger';
+        },
+        driverStatusText(driver) {
+          if (!driver.installed) {
+            return this.$t('troubleshooting.driver_status_not_installed');
+          }
+          if (driver.version_compatible) {
+            return this.$t('troubleshooting.driver_status_compatible');
+          }
+          return this.$t('troubleshooting.driver_status_unsupported');
         },
         navigateToLog(direction) {
           const indices = this.errorWarningEntries;
