@@ -520,7 +520,12 @@ namespace va {
   };
 
   /**
-   * @brief VAAPI encode path that copies converted frames through system memory.
+   * @brief VAAPI encode path for captures that reside in system memory.
+   *
+   * The capture frame is uploaded to the GPU once via glTexSubImage2D(),
+   * converted to NV12 by the EGL shader pipeline, and rendered directly into
+   * the VAAPI surfaces through the PRIME interop; no intermediate copy goes
+   * back through system memory.
    */
   class va_ram_t: public va_t {
   public:
