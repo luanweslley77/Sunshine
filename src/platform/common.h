@@ -326,8 +326,11 @@ namespace platf {
     bgr0,  ///< Packed 8-bit B,G,R,0
     bgra,  ///< Packed 8-bit B,G,R,A
     xbgr2101010,  ///< Packed 10-bit X,B,G,R
+    xrgb2101010,  ///< Packed 10-bit X,R,G,B
     bgra1010102,  ///< Packed 10-bit B,G,R,A
     rgba1010102,  ///< Packed 10-bit R,G,B,A
+    bgrx1010102,  ///< Packed 10-bit B,G,R,X
+    rgbx1010102,  ///< Packed 10-bit R,G,B,X
     abgr2101010,  ///< Packed 10-bit A,B,G,R
     argb2101010,  ///< Packed 10-bit A,R,G,B
     unknown  ///< Unknown
@@ -358,8 +361,11 @@ namespace platf {
       _CONVERT(bgr0);
       _CONVERT(bgra);
       _CONVERT(xbgr2101010);
+      _CONVERT(xrgb2101010);
       _CONVERT(bgra1010102);
       _CONVERT(rgba1010102);
+      _CONVERT(bgrx1010102);
+      _CONVERT(rgbx1010102);
       _CONVERT(abgr2101010);
       _CONVERT(argb2101010);
       _CONVERT(unknown);

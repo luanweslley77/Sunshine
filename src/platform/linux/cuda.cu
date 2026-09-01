@@ -64,8 +64,11 @@ namespace platf {
     bgr0,
     bgra,
     xbgr2101010,
+    xrgb2101010,
     bgra1010102,
     rgba1010102,
+    bgrx1010102,
+    rgbx1010102,
     abgr2101010,
     argb2101010,
     unknown

@@ -98,14 +98,36 @@ namespace video {
           return AV_PIX_FMT_BGRA;
         case xbgr2101010:
           return AV_PIX_FMT_X2BGR10LE;
+        case xrgb2101010:
+          return AV_PIX_FMT_X2RGB10LE;
+        case bgrx1010102:
+#ifdef AV_PIX_FMT_BGRA1010102LE
+          return AV_PIX_FMT_BGRA1010102LE;
+#else
+          return AV_PIX_FMT_NONE;
+#endif
+        case rgbx1010102:
+#ifdef AV_PIX_FMT_RGBA1010102LE
+          return AV_PIX_FMT_RGBA1010102LE;
+#else
+          return AV_PIX_FMT_NONE;
+#endif
         case abgr2101010:
           return AV_PIX_FMT_X2BGR10LE;
         case argb2101010:
           return AV_PIX_FMT_X2RGB10LE;
         case bgra1010102:
+#ifdef AV_PIX_FMT_BGRA1010102LE
           return AV_PIX_FMT_BGRA1010102LE;
+#else
+          return AV_PIX_FMT_NONE;
+#endif
         case rgba1010102:
+#ifdef AV_PIX_FMT_RGBA1010102LE
           return AV_PIX_FMT_RGBA1010102LE;
+#else
+          return AV_PIX_FMT_NONE;
+#endif
         default:
           return AV_PIX_FMT_NONE;
       }
@@ -1990,6 +2012,7 @@ namespace video {
     int height,
     std::unique_ptr<platf::avcodec_encode_device_t> encode_device
   ) {
+    BOOST_LOG(info) << "make_avcodec_encode_session called for " << encoder.name << " fmt=" << config.videoFormat << " hdr=" << config.dynamicRange;
     auto platform_formats = dynamic_cast<const encoder_platform_formats_avcodec *>(encoder.platform_formats.get());
     if (!platform_formats) {
       return nullptr;
@@ -1999,6 +2022,7 @@ namespace video {
 
     auto &video_format = encoder.codec_from_config(config);
     if (!video_format[encoder_t::PASSED] || !disp->is_codec_supported(video_format.name, config)) {
+      BOOST_LOG(info) << "make_session: PASSED=" << video_format[encoder_t::PASSED] << " is_codec_supported=" << disp->is_codec_supported(video_format.name, config) << " for " << video_format.name << " hdr=" << config.dynamicRange;
       BOOST_LOG(error) << encoder.name << ": "sv << video_format.name << " mode not supported"sv;
       return nullptr;
     }
@@ -2010,12 +2034,14 @@ namespace video {
       }
 
       if (config.dynamicRange && !video_format[encoder_t::DYNAMIC_RANGE_YUV444]) {
+        BOOST_LOG(info) << "make_session: YUV444 HDR check failed for " << video_format.name << " DYNAMIC_RANGE_YUV444=" << video_format[encoder_t::DYNAMIC_RANGE_YUV444];
         BOOST_LOG(error) << video_format.name << ": YUV 4:4:4 dynamic range not supported"sv;
         return nullptr;
       }
 
     } else {
       if (config.dynamicRange && !video_format[encoder_t::DYNAMIC_RANGE]) {
+        BOOST_LOG(info) << "make_session: HDR check failed for " << video_format.name << " DYNAMIC_RANGE=" << video_format[encoder_t::DYNAMIC_RANGE] << " hdr=" << config.dynamicRange;
         BOOST_LOG(error) << video_format.name << ": dynamic range not supported"sv;
         return nullptr;
       }
@@ -3033,11 +3059,13 @@ namespace video {
   int validate_config(std::shared_ptr<platf::display_t> disp, const encoder_t &encoder, const config_t &config) {
     auto encode_device = make_encode_device(*disp, encoder, config);
     if (!encode_device) {
+      BOOST_LOG(info) << "validate_config: make_encode_device failed for " << encoder.name << " fmt=" << config.videoFormat << " hdr=" << config.dynamicRange;
       return -1;
     }
 
     auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
     if (!session) {
+      BOOST_LOG(info) << "validate_config: make_encode_session failed for " << encoder.name << " fmt=" << config.videoFormat << " hdr=" << config.dynamicRange;
       return -1;
     }
 
@@ -3194,6 +3222,8 @@ namespace video {
       encoder.av1.capabilities.reset();
     }
 
+    BOOST_LOG(info) << "PROBE START: testing HDR for output=" << output_name << " raw_output=" << config::video.output_name << " hevc_mode=" << (int)config::video.hevc_mode << " av1_mode=" << (int)config::video.av1_mode;
+    BOOST_LOG(info) << "ENTER HDR TEST BLOCK for " << output_name;
     // Test HDR and YUV444 support
     {
       auto test_yuv444 = [&](auto &flag_map, auto video_format) {
@@ -3218,18 +3248,25 @@ namespace video {
 
       auto test_yuv420_hdr = [&](auto &flag_map, auto video_format) {
         const config_t config = {1920, 1080, 60, 6000, 1000, 1, 0, 3, video_format, 1, 0};
+        BOOST_LOG(info) << "HDR probe: testing HDR for " << output_name << " videoFormat=" << video_format << " hevc_mode=3";
 
         reset_display(disp, encoder.platform_formats->dev_type, output_name, config);
         if (!disp) {
+          BOOST_LOG(info) << "HDR probe: reset_display failed for HDR " << output_name;
           return;
         }
+        BOOST_LOG(info) << "HDR probe: reset_display ok for " << output_name << " disp=" << (disp ? "true" : "false");
         if (!flag_map[encoder_t::PASSED]) {
+          BOOST_LOG(debug) << "HDR probe: PASSED false for HDR";
           return;
         }
 
         auto encoder_codec_name = encoder.codec_from_config(config).name;
+        bool codec_ok = disp->is_codec_supported(encoder_codec_name, config);
+        int valid = validate_config(disp, encoder, config);
+        BOOST_LOG(info) << "HDR probe: codec=" << encoder_codec_name << " is_codec_supported=" << codec_ok << " validate=" << valid << " for " << output_name;
 
-        if (disp->is_codec_supported(encoder_codec_name, config) && validate_config(disp, encoder, config) >= 0) {
+        if (codec_ok && valid >= 0) {
           flag_map[encoder_t::DYNAMIC_RANGE] = true;
         } else {
           flag_map[encoder_t::DYNAMIC_RANGE] = false;
@@ -3241,6 +3278,7 @@ namespace video {
 
         reset_display(disp, encoder.platform_formats->dev_type, output_name, config);
         if (!disp) {
+          BOOST_LOG(info) << "HDR444 probe: reset_display failed for HDR " << output_name;
           return;
         }
         if (!flag_map[encoder_t::PASSED]) {
@@ -3284,6 +3322,7 @@ namespace video {
   }
 
   int probe_encoders() {
+    BOOST_LOG(info) << "PROBE ENCODERS CALLED hevc_mode=" << (int)config::video.hevc_mode << " output=" << config::video.output_name;
     if (!allow_encoder_probing()) {
       // Error already logged
       return -1;

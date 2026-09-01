@@ -69,14 +69,20 @@ namespace {
         return bgra;
       case SPA_VIDEO_FORMAT_xBGR_210LE:
         return xbgr2101010;
+      case SPA_VIDEO_FORMAT_xRGB_210LE:
+        return xrgb2101010;
       case SPA_VIDEO_FORMAT_ARGB_210LE:
-        return bgra1010102;
-      case SPA_VIDEO_FORMAT_ABGR_210LE:
-        return rgba1010102;
-      case SPA_VIDEO_FORMAT_RGBA_102LE:
-        return abgr2101010;
-      case SPA_VIDEO_FORMAT_BGRA_102LE:
         return argb2101010;
+      case SPA_VIDEO_FORMAT_ABGR_210LE:
+        return abgr2101010;
+      case SPA_VIDEO_FORMAT_RGBA_102LE:
+        return rgba1010102;
+      case SPA_VIDEO_FORMAT_BGRA_102LE:
+        return bgra1010102;
+      case SPA_VIDEO_FORMAT_RGBx_102LE:
+        return rgbx1010102;
+      case SPA_VIDEO_FORMAT_BGRx_102LE:
+        return bgrx1010102;
       default:
         return unknown;
     }
@@ -94,13 +100,16 @@ namespace pipewire {
     int32_t pw_format;  ///< Matching PipeWire SPA video format.
   };
 
-  static constexpr std::array<format_map_t, 8> format_map = {{
+  static constexpr std::array<format_map_t, 11> format_map = {{
     {DRM_FORMAT_NV12, SPA_VIDEO_FORMAT_NV12},
     {DRM_FORMAT_XBGR2101010, SPA_VIDEO_FORMAT_xBGR_210LE},
-    {DRM_FORMAT_BGRA1010102, SPA_VIDEO_FORMAT_ARGB_210LE},
-    {DRM_FORMAT_RGBA1010102, SPA_VIDEO_FORMAT_ABGR_210LE},
-    {DRM_FORMAT_ABGR2101010, SPA_VIDEO_FORMAT_RGBA_102LE},
-    {DRM_FORMAT_ARGB2101010, SPA_VIDEO_FORMAT_BGRA_102LE},
+    {DRM_FORMAT_XRGB2101010, SPA_VIDEO_FORMAT_xRGB_210LE},
+    {DRM_FORMAT_BGRA1010102, SPA_VIDEO_FORMAT_BGRA_102LE},
+    {DRM_FORMAT_RGBA1010102, SPA_VIDEO_FORMAT_RGBA_102LE},
+    {DRM_FORMAT_BGRX1010102, SPA_VIDEO_FORMAT_BGRx_102LE},
+    {DRM_FORMAT_RGBX1010102, SPA_VIDEO_FORMAT_RGBx_102LE},
+    {DRM_FORMAT_ABGR2101010, SPA_VIDEO_FORMAT_ABGR_210LE},
+    {DRM_FORMAT_ARGB2101010, SPA_VIDEO_FORMAT_ARGB_210LE},
     {DRM_FORMAT_ARGB8888, SPA_VIDEO_FORMAT_BGRA},
     {DRM_FORMAT_XRGB8888, SPA_VIDEO_FORMAT_BGRx},
   }};
