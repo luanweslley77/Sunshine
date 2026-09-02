@@ -345,6 +345,16 @@ namespace platf {
     yuv444p16,  ///< Planar 10-bit (shifted to 16-bit) YUV 4:4:4
     yuv444p,  ///< Planar 8-bit YUV 4:4:4
     y410,  ///< Y410
+    bgr0,  ///< Packed 8-bit B,G,R,0
+    bgra,  ///< Packed 8-bit B,G,R,A
+    xbgr2101010,  ///< Packed 10-bit X,B,G,R
+    xrgb2101010,  ///< Packed 10-bit X,R,G,B
+    bgra1010102,  ///< Packed 10-bit B,G,R,A
+    rgba1010102,  ///< Packed 10-bit R,G,B,A
+    bgrx1010102,  ///< Packed 10-bit B,G,R,X
+    rgbx1010102,  ///< Packed 10-bit R,G,B,X
+    abgr2101010,  ///< Packed 10-bit A,B,G,R
+    argb2101010,  ///< Packed 10-bit A,R,G,B
     unknown  ///< Unknown
   };
 
@@ -370,11 +380,90 @@ namespace platf {
       _CONVERT(yuv444p16);
       _CONVERT(yuv444p);
       _CONVERT(y410);
+      _CONVERT(bgr0);
+      _CONVERT(bgra);
+      _CONVERT(xbgr2101010);
+      _CONVERT(xrgb2101010);
+      _CONVERT(bgra1010102);
+      _CONVERT(rgba1010102);
+      _CONVERT(bgrx1010102);
+      _CONVERT(rgbx1010102);
+      _CONVERT(abgr2101010);
+      _CONVERT(argb2101010);
       _CONVERT(unknown);
     }
 #undef _CONVERT
 
     return "unknown"sv;
+  }
+
+  /**
+   * @brief Check whether a capture pixel format can be uploaded as packed 8-bit BGR.
+   * @note Unknown formats are treated as BGR0, the historical assumption for
+   * capture buffers that do not declare a format.
+   *
+   * @param pix_fmt Capture pixel format to check.
+   * @return True when the format is representable as packed 8-bit BGR.
+   */
+  inline bool is_bgr_capture_format(pix_fmt_e pix_fmt) {
+    using enum pix_fmt_e;
+
+    return pix_fmt == unknown || pix_fmt == bgr0 || pix_fmt == bgra;
+  }
+
+  /**
+   * @brief Check whether a capture pixel format can be downloaded from a DMA-BUF texture.
+   * @note Software capture imports a single-plane packed RGB/BGR EGL image and reads
+   * it back through OpenGL; planar and semi-planar formats stay on the memory-buffer path.
+   *
+   * @param pix_fmt Capture pixel format to check.
+   * @return True when the format is a packed RGB/BGR capture format.
+   */
+  inline bool is_software_downloadable_pix_fmt(pix_fmt_e pix_fmt) {
+    using enum pix_fmt_e;
+
+    switch (pix_fmt) {
+      case bgr0:
+      case bgra:
+      case xbgr2101010:
+      case xrgb2101010:
+      case bgra1010102:
+      case rgba1010102:
+      case bgrx1010102:
+      case rgbx1010102:
+      case abgr2101010:
+      case argb2101010:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * @brief Resolve the pixel format of a DMA-BUF frame after a GL readback.
+   * @note glGetTexImage with GL_RGBA and GL_UNSIGNED_INT_2_10_10_10_REV always
+   * emits red in the least-significant bits regardless of the source fourcc,
+   * mirroring RGB-ordered 10-bit formats onto their BGR twins. The result is
+   * bit-compatible with AV_PIX_FMT_X2BGR10LE/AV_PIX_FMT_BGRA1010102LE memory.
+   *
+   * @param pix_fmt Declared format of the negotiated source frame.
+   * @return Pixel format matching the readback buffer layout.
+   */
+  inline pix_fmt_e downloaded_pix_fmt(pix_fmt_e pix_fmt) {
+    using enum pix_fmt_e;
+
+    switch (pix_fmt) {
+      case xrgb2101010:
+        return xbgr2101010;
+      case argb2101010:
+        return abgr2101010;
+      case rgbx1010102:
+        return bgrx1010102;
+      case rgba1010102:
+        return bgra1010102;
+      default:
+        return pix_fmt;
+    }
   }
 
   // Dimensions for touchscreen input
@@ -536,6 +625,7 @@ namespace platf {
     std::int32_t height {};  ///< Image height in pixels.
     std::int32_t pixel_pitch {};  ///< Bytes per pixel in the image buffer.
     std::int32_t row_pitch {};  ///< Bytes between consecutive image rows.
+    pix_fmt_e pixel_format {pix_fmt_e::unknown};  ///< Declared pixel format of the captured image.
 
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.
 
