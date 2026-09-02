@@ -54,3 +54,50 @@ TEST(PixelFormatTests, FromPixFmt) {
   EXPECT_EQ(platf::from_pix_fmt(platf::pix_fmt_e::argb2101010), "argb2101010");
   EXPECT_EQ(platf::from_pix_fmt(platf::pix_fmt_e::unknown), "unknown");
 }
+
+/**
+ * @brief Only packed RGB/BGR formats can be downloaded from a DMA-BUF texture by
+ *        software capture; planar and semi-planar formats must stay on the memory path.
+ */
+TEST(PixelFormatTests, IsSoftwareDownloadablePixFmt) {
+  EXPECT_TRUE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::bgr0));
+  EXPECT_TRUE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::bgra));
+  EXPECT_TRUE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::xbgr2101010));
+  EXPECT_TRUE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::xrgb2101010));
+  EXPECT_TRUE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::bgra1010102));
+  EXPECT_TRUE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::rgba1010102));
+  EXPECT_TRUE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::bgrx1010102));
+  EXPECT_TRUE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::rgbx1010102));
+  EXPECT_TRUE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::abgr2101010));
+  EXPECT_TRUE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::argb2101010));
+
+  EXPECT_FALSE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::unknown));
+  EXPECT_FALSE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::nv12));
+  EXPECT_FALSE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::p010));
+  EXPECT_FALSE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::yuv420p));
+  EXPECT_FALSE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::yuv420p10));
+  EXPECT_FALSE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::ayuv));
+  EXPECT_FALSE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::yuv444p));
+  EXPECT_FALSE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::yuv444p16));
+  EXPECT_FALSE(platf::is_software_downloadable_pix_fmt(platf::pix_fmt_e::y410));
+}
+
+/**
+ * @brief A GL readback emits red in the least-significant bits, so RGB-ordered
+ *        10-bit formats mirror onto their BGR twins while BGR-ordered and
+ *        non-10-bit formats pass through unchanged.
+ */
+TEST(PixelFormatTests, DownloadedPixFmt) {
+  EXPECT_EQ(platf::downloaded_pix_fmt(platf::pix_fmt_e::xrgb2101010), platf::pix_fmt_e::xbgr2101010);
+  EXPECT_EQ(platf::downloaded_pix_fmt(platf::pix_fmt_e::argb2101010), platf::pix_fmt_e::abgr2101010);
+  EXPECT_EQ(platf::downloaded_pix_fmt(platf::pix_fmt_e::rgbx1010102), platf::pix_fmt_e::bgrx1010102);
+  EXPECT_EQ(platf::downloaded_pix_fmt(platf::pix_fmt_e::rgba1010102), platf::pix_fmt_e::bgra1010102);
+
+  EXPECT_EQ(platf::downloaded_pix_fmt(platf::pix_fmt_e::xbgr2101010), platf::pix_fmt_e::xbgr2101010);
+  EXPECT_EQ(platf::downloaded_pix_fmt(platf::pix_fmt_e::abgr2101010), platf::pix_fmt_e::abgr2101010);
+  EXPECT_EQ(platf::downloaded_pix_fmt(platf::pix_fmt_e::bgrx1010102), platf::pix_fmt_e::bgrx1010102);
+  EXPECT_EQ(platf::downloaded_pix_fmt(platf::pix_fmt_e::bgra1010102), platf::pix_fmt_e::bgra1010102);
+  EXPECT_EQ(platf::downloaded_pix_fmt(platf::pix_fmt_e::bgr0), platf::pix_fmt_e::bgr0);
+  EXPECT_EQ(platf::downloaded_pix_fmt(platf::pix_fmt_e::bgra), platf::pix_fmt_e::bgra);
+  EXPECT_EQ(platf::downloaded_pix_fmt(platf::pix_fmt_e::unknown), platf::pix_fmt_e::unknown);
+}

@@ -99,8 +99,11 @@ namespace pipewire {
   static constexpr std::array<format_map_t, 11> format_map = {{
     {DRM_FORMAT_NV12, SPA_VIDEO_FORMAT_NV12},
     {DRM_FORMAT_XBGR2101010, SPA_VIDEO_FORMAT_xBGR_210LE},
+    {DRM_FORMAT_XRGB2101010, SPA_VIDEO_FORMAT_xRGB_210LE},
     {DRM_FORMAT_BGRA1010102, SPA_VIDEO_FORMAT_BGRA_102LE},
     {DRM_FORMAT_RGBA1010102, SPA_VIDEO_FORMAT_RGBA_102LE},
+    {DRM_FORMAT_BGRX1010102, SPA_VIDEO_FORMAT_BGRx_102LE},
+    {DRM_FORMAT_RGBX1010102, SPA_VIDEO_FORMAT_RGBx_102LE},
     {DRM_FORMAT_ABGR2101010, SPA_VIDEO_FORMAT_ABGR_210LE},
     {DRM_FORMAT_ARGB2101010, SPA_VIDEO_FORMAT_ARGB_210LE},
     {DRM_FORMAT_ARGB8888, SPA_VIDEO_FORMAT_BGRA},
@@ -173,6 +176,8 @@ namespace pipewire {
     }
 
     bool data_owned = false;  ///< Whether img->data is owned by this image and must be freed.
+
+    std::vector<uint8_t> ram_frame;  ///< RAM staging buffer receiving downloaded DMA-BUF frames for software capture.
   };
 
   /**
@@ -342,14 +347,27 @@ namespace pipewire {
         std::array<const struct spa_pod *, MAX_PARAMS> params;
 
         // Add preferred parameters for DMA-BUF with modifiers
-        // Use DMA-BUF for VAAPI, or for CUDA when the display GPU is NVIDIA (pure NVIDIA system).
+        // Use DMA-BUF for VAAPI, for CUDA when the display GPU is NVIDIA (pure NVIDIA system),
+        // and for software capture (system). Software capture keeps frames in system memory,
+        // but it can still accept DMA-BUF: the compositor renders on the GPU, and downloading
+        // an imported texture once (glGetTextureSubImage) replaces the compositor-side CPU blit
+        // into a shared memory buffer, mirroring the KMS RAM capture path. This is how 10-bit
+        // HDR reaches software encoders on compositors whose memory-buffer path cannot carry it.
         // On hybrid GPU systems (Intel+NVIDIA), DMA-BUFs come from the Intel GPU and cannot
         // be imported into CUDA, so we fall back to memory buffers in that case.
         bool use_dmabuf = n_dmabuf_infos > 0 && (mem_type == platf::mem_type_e::vaapi ||
                                                  mem_type == platf::mem_type_e::vulkan ||
+                                                 mem_type == platf::mem_type_e::system ||
                                                  (mem_type == platf::mem_type_e::cuda && display_is_nvidia));
+        BOOST_LOG(debug) << "[pipewire] ensure_stream mem_type="sv << (int) mem_type << " n_dmabuf="sv << n_dmabuf_infos << " display_is_nvidia="sv << display_is_nvidia << " use_dmabuf="sv << use_dmabuf;
         if (use_dmabuf) {
           for (int i = 0; i < n_dmabuf_infos; i++) {
+            // The software download path only understands packed RGB/BGR textures;
+            // leave semi-planar formats to the memory-buffer fallback.
+            if (mem_type == platf::mem_type_e::system && !platf::is_software_downloadable_pix_fmt(map_spa_pix_fmt(dmabuf_infos[i].format))) {
+              continue;
+            }
+
             auto format_param = build_format_parameter(&pod_builder, width, height, target_framerate, dmabuf_infos[i].format, dmabuf_infos[i].modifiers, dmabuf_infos[i].n_modifiers);
             params[n_params] = format_param;
             n_params++;
@@ -439,6 +457,7 @@ namespace pipewire {
       img_descriptor->sd.height = d.format.info.raw.size.height;
       img_descriptor->sd.modifier = d.format.info.raw.modifier;
       img_descriptor->sd.fourcc = d.drm_format;
+      img_descriptor->pixel_format = map_spa_pix_fmt(d.format.info.raw.format);
       for (int i = 0; i < MIN(buf->n_datas, 4); i++) {
         img_descriptor->sd.fds[i] = dup(buf->datas[i].fd);
         img_descriptor->sd.pitches[i] = buf->datas[i].chunk->stride;
@@ -536,9 +555,18 @@ namespace pipewire {
         spa_pod_builder_add(b, SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&framerates[0]), 0);
       }
 
-      if (format == SPA_VIDEO_FORMAT_xBGR_210LE) {
+      // HDR is 2:10:10:10 (xBGR/xRGB/ABGR/ARGB2101010) with BT2020/PQ. KMS
+      // reads the 10-bit HDR FB directly, but KWin/portal PipeWire only
+      // sends BT2020/PQ when the pod requests it – without this KWin
+      // tone-maps to 8-bit SDR BGRx (primaries 0) even though the output
+      // is hdr:enabled, which is why KMS HDR works and kwin/portal SDR
+      // was seen. Stamp HDR for all 2:10:10:10 variants; keep 10:10:10:2
+      // (1010102) as SDR 10-bit (Rec.709) – they can carry 10-bit SDR.
+      if (format == SPA_VIDEO_FORMAT_xBGR_210LE || format == SPA_VIDEO_FORMAT_xRGB_210LE
+          || format == SPA_VIDEO_FORMAT_ARGB_210LE || format == SPA_VIDEO_FORMAT_ABGR_210LE) {
         spa_pod_builder_add(b, SPA_FORMAT_VIDEO_colorPrimaries, SPA_POD_Id(SPA_VIDEO_COLOR_PRIMARIES_BT2020), 0);
         spa_pod_builder_add(b, SPA_FORMAT_VIDEO_transferFunction, SPA_POD_Id(SPA_VIDEO_TRANSFER_SMPTE2084), 0);
+        BOOST_LOG(debug) << "[pipewire] Requesting HDR BT2020/PQ for "sv << format << ' ' << width << 'x' << height;
       }
 
       if (n_modifiers) {
@@ -871,6 +899,26 @@ namespace pipewire {
         return -1;
       }
 
+      // Software capture consumes frames in system memory. When the compositor can
+      // share GPU buffers, keep a private EGL display/context so DMA-BUF frames can
+      // be imported and downloaded without involving the encoder. On any EGL failure
+      // drop the DMA-BUF offer so negotiation falls back to memory buffers.
+      if (mem_type == platf::mem_type_e::system && n_dmabuf_infos > 0) {
+        ram_display = egl::make_display(wl_display.get());
+        if (!ram_display) {
+          BOOST_LOG(warning) << "[pipewire] Failed to create EGL display for DMA-BUF download; using memory buffers"sv;
+          n_dmabuf_infos = 0;
+        } else {
+          auto ctx_opt = egl::make_ctx(ram_display.get());
+          if (!ctx_opt) {
+            BOOST_LOG(warning) << "[pipewire] Failed to create EGL context for DMA-BUF download; using memory buffers"sv;
+            n_dmabuf_infos = 0;
+          } else {
+            ram_ctx = std::move(*ctx_opt);
+          }
+        }
+      }
+
       int pipewire_fd = -1;
       auto pipewire_node = PW_ID_ANY;  // Default for invalid stream from pipewire docs
       uint64_t pipewire_object_serial = SPA_ID_INVALID;  // Default for invalid stream from pipewire docs for PW_KEY_OBJECT_SERIAL
@@ -960,9 +1008,18 @@ namespace pipewire {
           return platf::capture_e::interrupted;
         }
 
-        auto *img_egl = static_cast<egl::img_descriptor_t *>(img_out.get());
+        auto *img_egl = static_cast<img_descriptor_t *>(img_out.get());
         img_egl->reset();
         pipewire.fill_img(img_egl);
+
+        // The software encoder reads frames from system memory: when the
+        // compositor negotiated DMA-BUF, download the frame into the image's
+        // RAM staging buffer before handing it to the capture pipeline.
+        if (mem_type == platf::mem_type_e::system && img_egl->sd.fds[0] >= 0) {
+          if (download_dmabuf_frame(*img_egl) < 0) {
+            return platf::capture_e::error;
+          }
+        }
 
         // Check if we got valid data (either DMA-BUF fd or memory pointer), then filter duplicates
         if ((img_egl->sd.fds[0] >= 0 || img_egl->data != nullptr) && !is_buffer_redundant(img_egl)) {
@@ -1273,6 +1330,81 @@ namespace pipewire {
     }
 
   private:
+    /**
+     * @brief Download a DMA-BUF frame into the image's RAM staging buffer.
+     * @note Used by software capture when the compositor negotiated DMA-BUF:
+     * the buffer is imported as an EGL image on the display GPU and read back
+     * through the private context, replacing the compositor-side CPU blit of
+     * the memory-buffer path. A GL readback with
+     * GL_RGBA/GL_UNSIGNED_INT_2_10_10_10_REV always emits red in the
+     * least-significant bits, so the declared format is normalized to the
+     * readback layout (see downloaded_pix_fmt).
+     *
+     * @param img Image descriptor carrying the DMA-BUF planes to download.
+     * @return 0 on success; negative when the format or the import is unsupported.
+     */
+    int download_dmabuf_frame(img_descriptor_t &img) {
+      using enum platf::pix_fmt_e;
+
+      GLenum gl_format;
+      GLenum gl_type;
+      switch (img.pixel_format) {
+        case bgr0:
+        case bgra:
+          gl_format = GL_BGRA;
+          gl_type = GL_UNSIGNED_BYTE;
+          break;
+        case xbgr2101010:
+        case xrgb2101010:
+        case bgra1010102:
+        case rgba1010102:
+        case bgrx1010102:
+        case rgbx1010102:
+        case abgr2101010:
+        case argb2101010:
+          gl_format = GL_RGBA;
+          gl_type = GL_UNSIGNED_INT_2_10_10_10_REV;
+          img.pixel_format = platf::downloaded_pix_fmt(img.pixel_format);
+          break;
+        default:
+          BOOST_LOG(error) << "[pipewire] Cannot download DMA-BUF for pixel format: "sv << platf::from_pix_fmt(img.pixel_format);
+          return -1;
+      }
+
+      BOOST_LOG(debug) << "[pipewire] Downloading DMA-BUF frame fd="sv << img.sd.fds[0] << " fourcc="sv << util::hex(img.sd.fourcc).to_string_view() << " pix_fmt="sv << platf::from_pix_fmt(img.pixel_format) << " "sv << img.sd.width << 'x' << img.sd.height << " modifier="sv << util::hex(img.sd.modifier).to_string_view() << " via EGL import"sv;
+
+      auto rgb_opt = egl::import_source(ram_display.get(), img.sd);
+      if (!rgb_opt) {
+        BOOST_LOG(error) << "[pipewire] Failed to import DMA-BUF frame for software capture"sv;
+        return -1;
+      }
+
+      auto &rgb = *rgb_opt;
+      BOOST_LOG(debug) << "[pipewire] DMA-BUF EGL import OK tex="sv << rgb->tex[0] << " -> ram_frame "sv << width << 'x' << height << " gl_format="sv << util::hex(gl_format).to_string_view() << " gl_type="sv << util::hex(gl_type).to_string_view() << " downloaded_pix_fmt="sv << platf::from_pix_fmt(img.pixel_format) << " bpp=4"sv;
+
+      // A dummy image may have pre-allocated an owned buffer on this image;
+      // release it before pointing at the staging vector to keep ownership straight.
+      if (img.data_owned) {
+        delete[] img.data;
+        img.data = nullptr;
+        img.data_owned = false;
+      }
+
+      img.row_pitch = width * 4;
+      img.pixel_pitch = 4;
+      img.ram_frame.resize(static_cast<std::size_t>(img.row_pitch) * height);
+      img.data = img.ram_frame.data();
+      img.data_owned = false;
+
+      gl::ctx.BindTexture(GL_TEXTURE_2D, rgb->tex[0]);
+      gl::ctx.GetTextureSubImage(rgb->tex[0], 0, 0, 0, 0, width, height, 1, gl_format, gl_type, static_cast<GLsizei>(img.ram_frame.size()), img.data);
+      gl::ctx.BindTexture(GL_TEXTURE_2D, 0);
+
+      gl_drain_errors;
+
+      return 0;
+    }
+
     bool is_buffer_redundant(const egl::img_descriptor_t *img) {
       // Check for corrupted frame
       if (img->pw_flags.has_value() && (img->pw_flags.value() & SPA_CHUNK_FLAG_CORRUPTED)) {
@@ -1321,9 +1453,11 @@ namespace pipewire {
     }
 
     void query_dmabuf_formats(EGLDisplay egl_display) {
+      BOOST_LOG(debug) << "[pipewire] query_dmabuf_formats EGL display="sv << egl_display;
       EGLint num_dmabuf_formats = 0;
       std::array<EGLint, MAX_DMABUF_FORMATS> dmabuf_formats = {0};
       eglQueryDmaBufFormatsEXT(egl_display, MAX_DMABUF_FORMATS, dmabuf_formats.data(), &num_dmabuf_formats);
+      BOOST_LOG(debug) << "[pipewire] EGL dmabuf formats: "sv << num_dmabuf_formats;
 
       if (num_dmabuf_formats > MAX_DMABUF_FORMATS) {
         BOOST_LOG(warning) << "[pipewire] Some DMA-BUF formats are being ignored"sv;
@@ -1404,8 +1538,10 @@ namespace pipewire {
 
     platf::mem_type_e mem_type;
     wl::display_t wl_display;
+    egl::display_t ram_display;  ///< EGL display used to import DMA-BUF frames for software capture.
+    egl::ctx_t ram_ctx;  ///< EGL context made current while downloading DMA-BUF frames for software capture.
     std::array<struct dmabuf_format_info_t, MAX_DMABUF_FORMATS> dmabuf_infos;
-    int n_dmabuf_infos;
+    int n_dmabuf_infos {};  ///< Number of valid entries in dmabuf_infos.
     bool display_is_nvidia = false;  // Track if display GPU is NVIDIA
     std::chrono::nanoseconds delay;
     std::optional<std::uint64_t> last_pts {};
