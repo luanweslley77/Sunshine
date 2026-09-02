@@ -75,6 +75,100 @@ namespace video {
       BOOST_LOG(error) << "No display devices are active at the moment! Cannot probe the encoders.";
       return false;
     }
+
+    /**
+     * @brief Map a declared capture pixel format to its FFmpeg equivalent.
+     * @note Formats without an FFmpeg equivalent in the bundled build-deps
+     * FFmpeg map to AV_PIX_FMT_NONE, letting callers fail loudly.
+     *
+     * @param pix_fmt Declared capture pixel format.
+     * @return FFmpeg pixel format; AV_PIX_FMT_NONE when the value is not a capture format.
+     */
+    AVPixelFormat map_capture_pix_fmt(platf::pix_fmt_e pix_fmt) {
+      using enum platf::pix_fmt_e;
+
+      switch (pix_fmt) {
+        case nv12:
+          return AV_PIX_FMT_NV12;
+        case p010:
+          return AV_PIX_FMT_P010;
+        case bgr0:
+          return AV_PIX_FMT_BGR0;
+        case bgra:
+          return AV_PIX_FMT_BGRA;
+        case xbgr2101010:
+          return AV_PIX_FMT_X2BGR10LE;
+        case xrgb2101010:
+          return AV_PIX_FMT_X2RGB10LE;
+        case bgrx1010102:
+          return AV_PIX_FMT_BGRA1010102LE;
+        case rgbx1010102:
+          return AV_PIX_FMT_RGBA1010102LE;
+        case abgr2101010:
+          return AV_PIX_FMT_X2BGR10LE;
+        case argb2101010:
+          return AV_PIX_FMT_X2RGB10LE;
+        case bgra1010102:
+          return AV_PIX_FMT_BGRA1010102LE;
+        case rgba1010102:
+          return AV_PIX_FMT_RGBA1010102LE;
+        default:
+          return AV_PIX_FMT_NONE;
+      }
+    }
+
+    /**
+     * @brief Resolve the FFmpeg pixel format for a capture image.
+     * @note Uses the format declared by the capture backend when it knows it,
+     * falling back to deriving the format from the bytes per pixel otherwise.
+     * PipeWire-based captures (KWin screencast / XDG portal) deliver NV12 with
+     * 1 byte per pixel, while KMS/DMABUF captures deliver BGR0 (4 bytes per
+     * pixel). The capture backend reports bytes per pixel in img.pixel_pitch;
+     * fall back to the row pitch heuristic when it is unavailable.
+     *
+     * @param img Capture image to resolve the input format for.
+     * @return FFmpeg pixel format; AV_PIX_FMT_NONE when the declared format is unsupported.
+     */
+    AVPixelFormat resolve_input_fmt(const platf::img_t &img) {
+      using enum platf::pix_fmt_e;
+
+      if (img.pixel_format == unknown) {
+        // No declared format; derive the format from the bytes per pixel.
+        const auto pixel_pitch = img.pixel_pitch > 0 ? img.pixel_pitch : (img.row_pitch / std::max(img.width, 1));
+        return (pixel_pitch == 1) ? AV_PIX_FMT_NV12 : AV_PIX_FMT_BGR0;
+      }
+
+      auto input_fmt = map_capture_pix_fmt(img.pixel_format);
+      if (input_fmt == AV_PIX_FMT_NONE) {
+        BOOST_LOG(error) << "Unsupported capture pixel format: "sv << platf::from_pix_fmt(img.pixel_format);
+      }
+      return input_fmt;
+    }
+
+    /**
+     * @brief Copy the scaled output frame into the padded output frame.
+     * @note Used when aspect ratio padding is required; copies line by line to
+     * preserve the leading padding for each row of every plane.
+     *
+     * @param padded_frame Destination frame carrying the aspect ratio padding.
+     * @param output_frame Source frame produced by the scaler.
+     * @param offset_w Horizontal offset in pixels of the scaled region.
+     * @param offset_h Vertical offset in pixels of the scaled region.
+     */
+    void copy_padded_frame(const AVFrame &padded_frame, const AVFrame &output_frame, int offset_w, int offset_h) {
+      auto fmt_desc = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(output_frame.format));
+      auto planes = av_pix_fmt_count_planes(static_cast<AVPixelFormat>(output_frame.format));
+      for (int plane = 0; plane < planes; plane++) {
+        auto shift_h = plane == 0 ? 0 : fmt_desc->log2_chroma_h;
+        auto shift_w = plane == 0 ? 0 : fmt_desc->log2_chroma_w;
+        auto offset = ((offset_w >> shift_w) * fmt_desc->comp[plane].step) + (offset_h >> shift_h) * padded_frame.linesize[plane];
+
+        // Copy line-by-line to preserve leading padding for each row
+        for (int line = 0; line < output_frame.height >> shift_h; line++) {
+          memcpy(padded_frame.data[plane] + offset + (line * padded_frame.linesize[plane]), output_frame.data[plane] + (line * output_frame.linesize[plane]), static_cast<std::size_t>(output_frame.width >> shift_w) * fmt_desc->comp[plane].step);
+        }
+      }
+    }
   }  // namespace
 
   /**
@@ -225,13 +319,13 @@ namespace video {
     // If we need to add aspect ratio padding, we need to scale into an intermediate output buffer
     bool requires_padding = (sw_frame->width != sws_output_frame->width || sw_frame->height != sws_output_frame->height);
 
-    // Detect the actual capture pixel format. PipeWire-based captures (KWin
-    // screencast / XDG portal) deliver NV12 with 1 byte per pixel, while
-    // KMS/DMABUF captures deliver BGR0 (4 bytes per pixel). The capture
-    // backend reports bytes per pixel in img.pixel_pitch; fall back to the row
-    // pitch heuristic when it is unavailable.
-    const auto pixel_pitch = img.pixel_pitch > 0 ? img.pixel_pitch : (img.row_pitch / std::max(img.width, 1));
-    const auto input_fmt = (pixel_pitch == 1) ? AV_PIX_FMT_NV12 : AV_PIX_FMT_BGR0;
+    // Resolve the capture pixel format: use the format declared by the
+    // capture backend when available, deriving it from the bytes per pixel
+    // otherwise.
+    AVPixelFormat input_fmt = resolve_input_fmt(img);
+    if (input_fmt == AV_PIX_FMT_NONE) {
+      return -1;
+    }
 
     // The sws context is created with the default BGR0 source format;
     // recreate it once if the capture is actually NV12.
@@ -247,7 +341,7 @@ namespace video {
     // Setup the input frame using the caller's img_t
     sws_input_frame->data[0] = img.data;
     sws_input_frame->linesize[0] = img.row_pitch;
-    if (input_fmt == AV_PIX_FMT_NV12) {
+    if (input_fmt == AV_PIX_FMT_NV12 || input_fmt == AV_PIX_FMT_P010) {
       sws_input_frame->data[1] = img.data + static_cast<std::size_t>(img.row_pitch) * img.height;
       sws_input_frame->linesize[1] = img.row_pitch;
     } else {
@@ -269,18 +363,7 @@ namespace video {
 
     // If we require aspect ratio padding, copy the output frame into the final padded frame
     if (requires_padding) {
-      auto fmt_desc = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(sws_output_frame->format));
-      auto planes = av_pix_fmt_count_planes(static_cast<AVPixelFormat>(sws_output_frame->format));
-      for (int plane = 0; plane < planes; plane++) {
-        auto shift_h = plane == 0 ? 0 : fmt_desc->log2_chroma_h;
-        auto shift_w = plane == 0 ? 0 : fmt_desc->log2_chroma_w;
-        auto offset = ((offsetW >> shift_w) * fmt_desc->comp[plane].step) + (offsetH >> shift_h) * sw_frame->linesize[plane];
-
-        // Copy line-by-line to preserve leading padding for each row
-        for (int line = 0; line < sws_output_frame->height >> shift_h; line++) {
-          memcpy(sw_frame->data[plane] + offset + (line * sw_frame->linesize[plane]), sws_output_frame->data[plane] + (line * sws_output_frame->linesize[plane]), static_cast<std::size_t>(sws_output_frame->width >> shift_w) * fmt_desc->comp[plane].step);
-        }
-      }
+      copy_padded_frame(*sw_frame, *sws_output_frame, offsetW, offsetH);
     }
 
     // If frame is not a software frame, it means we still need to transfer from main memory
@@ -1939,6 +2022,7 @@ namespace video {
     int height,
     std::unique_ptr<platf::avcodec_encode_device_t> encode_device
   ) {
+    BOOST_LOG(info) << "make_avcodec_encode_session called for " << encoder.name << " fmt=" << config.videoFormat << " hdr=" << config.dynamicRange;
     auto platform_formats = dynamic_cast<const encoder_platform_formats_avcodec *>(encoder.platform_formats.get());
     if (!platform_formats) {
       return nullptr;
@@ -1948,6 +2032,7 @@ namespace video {
 
     auto &video_format = encoder.codec_from_config(config);
     if (!video_format[encoder_t::PASSED] || !disp->is_codec_supported(video_format.name, config)) {
+      BOOST_LOG(info) << "make_session: PASSED=" << video_format[encoder_t::PASSED] << " is_codec_supported=" << disp->is_codec_supported(video_format.name, config) << " for " << video_format.name << " hdr=" << config.dynamicRange;
       BOOST_LOG(error) << encoder.name << ": "sv << video_format.name << " mode not supported"sv;
       return nullptr;
     }
@@ -1959,12 +2044,14 @@ namespace video {
       }
 
       if (config.dynamicRange && !video_format[encoder_t::DYNAMIC_RANGE_YUV444]) {
+        BOOST_LOG(info) << "make_session: YUV444 HDR check failed for " << video_format.name << " DYNAMIC_RANGE_YUV444=" << video_format[encoder_t::DYNAMIC_RANGE_YUV444];
         BOOST_LOG(error) << video_format.name << ": YUV 4:4:4 dynamic range not supported"sv;
         return nullptr;
       }
 
     } else {
       if (config.dynamicRange && !video_format[encoder_t::DYNAMIC_RANGE]) {
+        BOOST_LOG(info) << "make_session: HDR check failed for " << video_format.name << " DYNAMIC_RANGE=" << video_format[encoder_t::DYNAMIC_RANGE] << " hdr=" << config.dynamicRange;
         BOOST_LOG(error) << video_format.name << ": dynamic range not supported"sv;
         return nullptr;
       }
@@ -2984,11 +3071,13 @@ namespace video {
   int validate_config(std::shared_ptr<platf::display_t> disp, const encoder_t &encoder, const config_t &config) {
     auto encode_device = make_encode_device(*disp, encoder, config);
     if (!encode_device) {
+      BOOST_LOG(info) << "validate_config: make_encode_device failed for " << encoder.name << " fmt=" << config.videoFormat << " hdr=" << config.dynamicRange;
       return -1;
     }
 
     auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
     if (!session) {
+      BOOST_LOG(info) << "validate_config: make_encode_session failed for " << encoder.name << " fmt=" << config.videoFormat << " hdr=" << config.dynamicRange;
       return -1;
     }
 
@@ -3145,6 +3234,8 @@ namespace video {
       encoder.av1.capabilities.reset();
     }
 
+    BOOST_LOG(info) << "PROBE START: testing HDR for output=" << output_name << " raw_output=" << config::video.output_name << " hevc_mode=" << (int)config::video.hevc_mode << " av1_mode=" << (int)config::video.av1_mode;
+    BOOST_LOG(info) << "ENTER HDR TEST BLOCK for " << output_name;
     // Test HDR and YUV444 support
     {
       auto test_yuv444 = [&](auto &flag_map, auto video_format) {
@@ -3169,18 +3260,25 @@ namespace video {
 
       auto test_yuv420_hdr = [&](auto &flag_map, auto video_format) {
         const config_t config = {1920, 1080, 60, 6000, 1000, 1, 0, 3, video_format, 1, 0};
+        BOOST_LOG(info) << "HDR probe: testing HDR for " << output_name << " videoFormat=" << video_format << " hevc_mode=3";
 
         reset_display(disp, encoder.platform_formats->dev_type, output_name, config);
         if (!disp) {
+          BOOST_LOG(info) << "HDR probe: reset_display failed for HDR " << output_name;
           return;
         }
+        BOOST_LOG(info) << "HDR probe: reset_display ok for " << output_name << " disp=" << (disp ? "true" : "false");
         if (!flag_map[encoder_t::PASSED]) {
+          BOOST_LOG(debug) << "HDR probe: PASSED false for HDR";
           return;
         }
 
         auto encoder_codec_name = encoder.codec_from_config(config).name;
+        bool codec_ok = disp->is_codec_supported(encoder_codec_name, config);
+        int valid = validate_config(disp, encoder, config);
+        BOOST_LOG(info) << "HDR probe: codec=" << encoder_codec_name << " is_codec_supported=" << codec_ok << " validate=" << valid << " for " << output_name;
 
-        if (disp->is_codec_supported(encoder_codec_name, config) && validate_config(disp, encoder, config) >= 0) {
+        if (codec_ok && valid >= 0) {
           flag_map[encoder_t::DYNAMIC_RANGE] = true;
         } else {
           flag_map[encoder_t::DYNAMIC_RANGE] = false;
@@ -3192,6 +3290,7 @@ namespace video {
 
         reset_display(disp, encoder.platform_formats->dev_type, output_name, config);
         if (!disp) {
+          BOOST_LOG(info) << "HDR444 probe: reset_display failed for HDR " << output_name;
           return;
         }
         if (!flag_map[encoder_t::PASSED]) {
@@ -3235,6 +3334,7 @@ namespace video {
   }
 
   int probe_encoders() {
+    BOOST_LOG(info) << "PROBE ENCODERS CALLED hevc_mode=" << (int)config::video.hevc_mode << " output=" << config::video.output_name;
     if (!allow_encoder_probing()) {
       // Error already logged
       return -1;

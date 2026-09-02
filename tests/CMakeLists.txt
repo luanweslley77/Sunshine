@@ -246,6 +246,14 @@ if(GCOV_LINK_LIBRARY)
     list(APPEND TEST_LINK_LIBRARIES ${GCOV_LINK_LIBRARY})
 endif()
 
+# Use same FFmpeg (bundled dist or download) as main sunshine - ensures BGRA patch visible before system headers
+if(DEFINED SUNSHINE_INCLUDE_DIRS)
+    target_include_directories(${PROJECT_NAME} BEFORE PRIVATE ${SUNSHINE_INCLUDE_DIRS})
+endif()
+if(DEFINED SUNSHINE_EXTERNAL_LIBRARIES)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${SUNSHINE_EXTERNAL_LIBRARIES})
+endif()
+
 target_link_libraries(${PROJECT_NAME} ${TEST_LINK_LIBRARIES})
 target_compile_definitions(${PROJECT_NAME} PUBLIC ${SUNSHINE_DEFINITIONS} ${TEST_DEFINITIONS})
 target_compile_options(${PROJECT_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>;$<$<COMPILE_LANGUAGE:CUDA>:${SUNSHINE_COMPILE_OPTIONS_CUDA};-std=c++17>)  # cmake-lint: disable=C0301
