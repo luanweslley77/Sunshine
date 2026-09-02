@@ -411,6 +411,61 @@ namespace platf {
     return pix_fmt == unknown || pix_fmt == bgr0 || pix_fmt == bgra;
   }
 
+  /**
+   * @brief Check whether a capture pixel format can be downloaded from a DMA-BUF texture.
+   * @note Software capture imports a single-plane packed RGB/BGR EGL image and reads
+   * it back through OpenGL; planar and semi-planar formats stay on the memory-buffer path.
+   *
+   * @param pix_fmt Capture pixel format to check.
+   * @return True when the format is a packed RGB/BGR capture format.
+   */
+  inline bool is_software_downloadable_pix_fmt(pix_fmt_e pix_fmt) {
+    using enum pix_fmt_e;
+
+    switch (pix_fmt) {
+      case bgr0:
+      case bgra:
+      case xbgr2101010:
+      case xrgb2101010:
+      case bgra1010102:
+      case rgba1010102:
+      case bgrx1010102:
+      case rgbx1010102:
+      case abgr2101010:
+      case argb2101010:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * @brief Resolve the pixel format of a DMA-BUF frame after a GL readback.
+   * @note glGetTexImage with GL_RGBA and GL_UNSIGNED_INT_2_10_10_10_REV always
+   * emits red in the least-significant bits regardless of the source fourcc,
+   * mirroring RGB-ordered 10-bit formats onto their BGR twins. The result is
+   * bit-compatible with AV_PIX_FMT_X2BGR10LE/AV_PIX_FMT_BGRA1010102LE memory.
+   *
+   * @param pix_fmt Declared format of the negotiated source frame.
+   * @return Pixel format matching the readback buffer layout.
+   */
+  inline pix_fmt_e downloaded_pix_fmt(pix_fmt_e pix_fmt) {
+    using enum pix_fmt_e;
+
+    switch (pix_fmt) {
+      case xrgb2101010:
+        return xbgr2101010;
+      case argb2101010:
+        return abgr2101010;
+      case rgbx1010102:
+        return bgrx1010102;
+      case rgba1010102:
+        return bgra1010102;
+      default:
+        return pix_fmt;
+    }
+  }
+
   // Dimensions for touchscreen input
   /**
    * @brief Touchscreen coordinate bounds used to scale absolute input.
