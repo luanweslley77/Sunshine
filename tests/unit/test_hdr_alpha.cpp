@@ -7,6 +7,9 @@
  * cover the alpha channel of those handlers: opaque alpha when the source has
  * no alpha, 2-bit to 8-bit expansion, output support and an exact 1:1 round
  * trip of all four 2-bit alpha values.
+ *
+ * The formats are little-endian and so are the helpers below, hence the
+ * fixture skips the suite on big-endian hosts.
  */
 #include "../tests_common.h"
 
@@ -54,16 +57,74 @@ namespace {
   }
 
   /**
+   * @brief Whether the host stores multi-byte values in big-endian order.
+   * @return true on a big-endian host.
+   */
+  constexpr bool is_big_endian() {
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__)
+    return __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__;
+#else
+    return false;
+#endif
+  }
+
+  /**
    * @brief The flag combinations exercised by the RGB output writers.
    */
   constexpr int output_flags[] = { SWS_POINT, SWS_POINT | SWS_FULL_CHR_H_INT };
+
+  /**
+   * @brief Convert a single row between two pixel formats with swscale.
+   * @param src_format Source pixel format.
+   * @param src_data Source plane pointers.
+   * @param src_stride Source plane strides.
+   * @param src_width Source width.
+   * @param dst_format Destination pixel format.
+   * @param dst_data Destination plane pointers.
+   * @param dst_stride Destination plane strides.
+   * @param dst_width Destination width.
+   * @param flags swscale flags.
+   * @return true when the context was created and the row was converted.
+   */
+  bool convert_row(enum AVPixelFormat src_format,
+                   const std::uint8_t *const src_data[4],
+                   const int src_stride[4],
+                   int src_width,
+                   enum AVPixelFormat dst_format,
+                   std::uint8_t *const dst_data[4],
+                   const int dst_stride[4],
+                   int dst_width,
+                   int flags) {
+    util::safe_ptr<SwsContext, sws_freeContext> sws {
+      sws_getContext(src_width, 1, src_format, dst_width, 1, dst_format,
+                     flags, nullptr, nullptr, nullptr)
+    };
+    if (!sws) {
+      ADD_FAILURE() << "sws_getContext failed";
+      return false;
+    }
+    return sws_scale(sws.get(), src_data, src_stride, 0, 1, dst_data, dst_stride) == 1;
+  }
 }
+
+/**
+ * @brief Fixture for the 1010102 alpha tests.
+ */
+class HdrAlpha: public ::testing::Test {
+protected:
+  void SetUp() override {
+    if (is_big_endian()) {
+      GTEST_SKIP() << "the 1010102 formats and test helpers are little-endian";
+    }
+  }
+};
 
 /**
  * @brief Both 1010102 formats must be advertised as swscale input and output.
  */
-TEST(HdrAlpha, FormatSupport) {
+TEST_F(HdrAlpha, FormatSupport) {
   EXPECT_EQ(sws_isSupportedInput(AV_PIX_FMT_BGRA1010102LE), 1);
+  EXPECT_EQ(sws_isSupportedInput(AV_PIX_FMT_RGBA1010102LE), 1);
   EXPECT_EQ(sws_isSupportedOutput(AV_PIX_FMT_BGRA1010102LE), 1);
   EXPECT_EQ(sws_isSupportedOutput(AV_PIX_FMT_RGBA1010102LE), 1);
 }
@@ -71,7 +132,7 @@ TEST(HdrAlpha, FormatSupport) {
 /**
  * @brief A 2-bit alpha source must expand to the 8-bit alpha levels 0/85/171/255.
  */
-TEST(HdrAlpha, TwoBitAlphaExpandsToEightBit) {
+TEST_F(HdrAlpha, TwoBitAlphaExpandsToEightBit) {
   constexpr int width = 4;
   std::uint32_t src[width];
   for (int i = 0; i < width; ++i) {
@@ -79,22 +140,17 @@ TEST(HdrAlpha, TwoBitAlphaExpandsToEightBit) {
   }
 
   const std::uint8_t *src_data[4] = { reinterpret_cast<const std::uint8_t *>(src), nullptr, nullptr, nullptr };
-  int src_stride[4] = { width * 4, 0, 0, 0 };
+  const int src_stride[4] = { width * 4, 0, 0, 0 };
 
   std::uint8_t dst_y[width] = {};
   std::uint8_t dst_u[width] = {};
   std::uint8_t dst_v[width] = {};
   std::uint8_t dst_a[width] = {};
   std::uint8_t *dst_data[4] = { dst_y, dst_u, dst_v, dst_a };
-  int dst_stride[4] = { width, 2, 2, width };
+  const int dst_stride[4] = { width, 2, 2, width };
 
-  auto sws = sws_getContext(width, 1, AV_PIX_FMT_BGRA1010102LE,
-                            width, 1, AV_PIX_FMT_YUVA420P,
-                            SWS_POINT, nullptr, nullptr, nullptr);
-  ASSERT_NE(sws, nullptr);
-
-  ASSERT_EQ(sws_scale(sws, src_data, src_stride, 0, 1, dst_data, dst_stride), 1);
-  sws_freeContext(sws);
+  ASSERT_TRUE(convert_row(AV_PIX_FMT_BGRA1010102LE, src_data, src_stride, width,
+                          AV_PIX_FMT_YUVA420P, dst_data, dst_stride, width, SWS_POINT));
 
   // 170 expands to 171 because FFmpeg rounds the 14-bit internal value, exactly
   // like it does for an 8-bit RGBA source with alpha 170.
@@ -107,27 +163,23 @@ TEST(HdrAlpha, TwoBitAlphaExpandsToEightBit) {
 /**
  * @brief An 8-bit alpha source must map onto the four 2-bit alpha levels.
  */
-TEST(HdrAlpha, EightBitAlphaMapsToTwoBit) {
+TEST_F(HdrAlpha, EightBitAlphaMapsToTwoBit) {
   constexpr int width = 4;
   std::uint8_t src_y[width] = { 128, 128, 128, 128 };
   std::uint8_t src_u[2] = { 128, 128 };
   std::uint8_t src_v[2] = { 128, 128 };
   std::uint8_t src_a[width] = { 0x55, 0xAA, 0xFF, 0x00 };
   const std::uint8_t *src_data[4] = { src_y, src_u, src_v, src_a };
-  int src_stride[4] = { width, 2, 2, width };
+  const int src_stride[4] = { width, 2, 2, width };
 
   for (int flags : output_flags) {
     constexpr int dst_width = 8;
     std::uint8_t dst[dst_width * 4] = {};
     std::uint8_t *dst_data[4] = { dst, nullptr, nullptr, nullptr };
-    int dst_stride[4] = { dst_width * 4, 0, 0, 0 };
+    const int dst_stride[4] = { dst_width * 4, 0, 0, 0 };
 
-    auto sws = sws_getContext(width, 1, AV_PIX_FMT_YUVA420P,
-                              dst_width, 1, AV_PIX_FMT_BGRA1010102LE,
-                              flags, nullptr, nullptr, nullptr);
-    ASSERT_NE(sws, nullptr);
-    ASSERT_EQ(sws_scale(sws, src_data, src_stride, 0, 1, dst_data, dst_stride), 1);
-    sws_freeContext(sws);
+    ASSERT_TRUE(convert_row(AV_PIX_FMT_YUVA420P, src_data, src_stride, width,
+                            AV_PIX_FMT_BGRA1010102LE, dst_data, dst_stride, dst_width, flags)) << "flags " << flags;
 
     constexpr std::uint32_t expected[4] = { 1, 2, 3, 0 };
     for (int i = 0; i < width; ++i) {
@@ -140,25 +192,21 @@ TEST(HdrAlpha, EightBitAlphaMapsToTwoBit) {
 /**
  * @brief A source without alpha must produce opaque (max) 2-bit alpha.
  */
-TEST(HdrAlpha, OpaqueAlphaWithoutSource) {
+TEST_F(HdrAlpha, OpaqueAlphaWithoutSource) {
   constexpr int width = 4;
   std::uint8_t src_y[width] = { 128, 128, 128, 128 };
   std::uint8_t src_u[2] = { 128, 128 };
   std::uint8_t src_v[2] = { 128, 128 };
   const std::uint8_t *src_data[4] = { src_y, src_u, src_v, nullptr };
-  int src_stride[4] = { width, 2, 2, 0 };
+  const int src_stride[4] = { width, 2, 2, 0 };
 
   for (int flags : output_flags) {
     std::uint8_t dst[width * 4] = {};
     std::uint8_t *dst_data[4] = { dst, nullptr, nullptr, nullptr };
-    int dst_stride[4] = { width * 4, 0, 0, 0 };
+    const int dst_stride[4] = { width * 4, 0, 0, 0 };
 
-    auto sws = sws_getContext(width, 1, AV_PIX_FMT_YUV420P,
-                              width, 1, AV_PIX_FMT_BGRA1010102LE,
-                              flags, nullptr, nullptr, nullptr);
-    ASSERT_NE(sws, nullptr);
-    ASSERT_EQ(sws_scale(sws, src_data, src_stride, 0, 1, dst_data, dst_stride), 1);
-    sws_freeContext(sws);
+    ASSERT_TRUE(convert_row(AV_PIX_FMT_YUV420P, src_data, src_stride, width,
+                            AV_PIX_FMT_BGRA1010102LE, dst_data, dst_stride, width, flags)) << "flags " << flags;
 
     for (int i = 0; i < width; ++i) {
       EXPECT_EQ(pixel_at(dst, i) & 0x3, 3) << "flags " << flags << " pixel " << i;
@@ -169,7 +217,7 @@ TEST(HdrAlpha, OpaqueAlphaWithoutSource) {
 /**
  * @brief Scaling must preserve all four 2-bit alpha values without loss.
  */
-TEST(HdrAlpha, TwoBitRoundTripPreservesAlpha) {
+TEST_F(HdrAlpha, TwoBitRoundTripPreservesAlpha) {
   constexpr int src_width = 4;
   constexpr int dst_width = 8;
 
@@ -179,18 +227,14 @@ TEST(HdrAlpha, TwoBitRoundTripPreservesAlpha) {
   }
 
   const std::uint8_t *src_data[4] = { reinterpret_cast<const std::uint8_t *>(src), nullptr, nullptr, nullptr };
-  int src_stride[4] = { src_width * 4, 0, 0, 0 };
+  const int src_stride[4] = { src_width * 4, 0, 0, 0 };
 
   std::uint8_t dst[dst_width * 4] = {};
   std::uint8_t *dst_data[4] = { dst, nullptr, nullptr, nullptr };
-  int dst_stride[4] = { dst_width * 4, 0, 0, 0 };
+  const int dst_stride[4] = { dst_width * 4, 0, 0, 0 };
 
-  auto sws = sws_getContext(src_width, 1, AV_PIX_FMT_BGRA1010102LE,
-                            dst_width, 1, AV_PIX_FMT_BGRA1010102LE,
-                            SWS_POINT, nullptr, nullptr, nullptr);
-  ASSERT_NE(sws, nullptr);
-  ASSERT_EQ(sws_scale(sws, src_data, src_stride, 0, 1, dst_data, dst_stride), 1);
-  sws_freeContext(sws);
+  ASSERT_TRUE(convert_row(AV_PIX_FMT_BGRA1010102LE, src_data, src_stride, src_width,
+                          AV_PIX_FMT_BGRA1010102LE, dst_data, dst_stride, dst_width, SWS_POINT));
 
   for (int i = 0; i < src_width; ++i) {
     EXPECT_EQ(pixel_at(dst, i * 2) & 0x3, static_cast<std::uint32_t>(i)) << "pixel " << i;
@@ -201,7 +245,7 @@ TEST(HdrAlpha, TwoBitRoundTripPreservesAlpha) {
 /**
  * @brief The RGBA and BGRA writers must place the channels at opposite ends.
  */
-TEST(HdrAlpha, ChannelOrder) {
+TEST_F(HdrAlpha, ChannelOrder) {
   constexpr int width = 4;
   std::uint32_t src[width];
   for (int i = 0; i < width; ++i) {
@@ -209,19 +253,15 @@ TEST(HdrAlpha, ChannelOrder) {
   }
 
   const std::uint8_t *src_data[4] = { reinterpret_cast<const std::uint8_t *>(src), nullptr, nullptr, nullptr };
-  int src_stride[4] = { width * 4, 0, 0, 0 };
+  const int src_stride[4] = { width * 4, 0, 0, 0 };
 
   for (auto dst_format : { AV_PIX_FMT_BGRA1010102LE, AV_PIX_FMT_RGBA1010102LE }) {
     std::uint8_t dst[width * 4] = {};
     std::uint8_t *dst_data[4] = { dst, nullptr, nullptr, nullptr };
-    int dst_stride[4] = { width * 4, 0, 0, 0 };
+    const int dst_stride[4] = { width * 4, 0, 0, 0 };
 
-    auto sws = sws_getContext(width, 1, AV_PIX_FMT_BGRA1010102LE,
-                              width, 1, dst_format,
-                              SWS_POINT, nullptr, nullptr, nullptr);
-    ASSERT_NE(sws, nullptr);
-    ASSERT_EQ(sws_scale(sws, src_data, src_stride, 0, 1, dst_data, dst_stride), 1);
-    sws_freeContext(sws);
+    ASSERT_TRUE(convert_row(AV_PIX_FMT_BGRA1010102LE, src_data, src_stride, width,
+                            dst_format, dst_data, dst_stride, width, SWS_POINT));
 
     for (int i = 0; i < width; ++i) {
       const auto pixel = pixel_at(dst, i);
