@@ -2,11 +2,12 @@
  * @file tests/unit/test_hdr_alpha.cpp
  * @brief Tests for the 2-bit alpha channel of the 10-bit HDR pixel formats.
  *
- * The bundled FFmpeg patch registers the DRM BGRA1010102/RGBA1010102 formats
- * and provides legacy swscale input and output handlers for them. These tests
- * cover the alpha channel of those handlers: opaque alpha when the source has
- * no alpha, 2-bit to 8-bit expansion, output support and an exact 1:1 round
- * trip of all four 2-bit alpha values.
+ * The bundled FFmpeg patch registers the DRM BGRA1010102/RGBA1010102 formats.
+ * swscale implements only the little-endian memory layout; the big-endian
+ * variants exist in libavutil for API completeness but are not supported by
+ * any swscale backend. These tests cover the alpha channel of the LE handlers:
+ * opaque alpha when the source has no alpha, 2-bit to 8-bit expansion, output
+ * support and an exact 1:1 round trip of all four 2-bit alpha values.
  *
  * The formats are little-endian and so are the helpers below, hence the
  * fixture skips the suite on big-endian hosts.
@@ -14,6 +15,7 @@
 #include "../tests_common.h"
 
 extern "C" {
+#include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
 #include <libswscale/swscale.h>
 }
@@ -120,13 +122,31 @@ protected:
 };
 
 /**
- * @brief Both 1010102 formats must be advertised as swscale input and output.
+ * @brief The little-endian formats must be advertised as swscale input and output.
  */
 TEST_F(HdrAlpha, FormatSupport) {
   EXPECT_EQ(sws_isSupportedInput(AV_PIX_FMT_BGRA1010102LE), 1);
   EXPECT_EQ(sws_isSupportedInput(AV_PIX_FMT_RGBA1010102LE), 1);
   EXPECT_EQ(sws_isSupportedOutput(AV_PIX_FMT_BGRA1010102LE), 1);
   EXPECT_EQ(sws_isSupportedOutput(AV_PIX_FMT_RGBA1010102LE), 1);
+}
+
+/**
+ * @brief The big-endian variants are libavutil-only and swscale must say so.
+ */
+TEST_F(HdrAlpha, BigEndianVariantsUnsupported) {
+  EXPECT_NE(av_pix_fmt_desc_get(AV_PIX_FMT_BGRA1010102BE), nullptr);
+  EXPECT_NE(av_pix_fmt_desc_get(AV_PIX_FMT_RGBA1010102BE), nullptr);
+
+  EXPECT_EQ(sws_isSupportedInput(AV_PIX_FMT_BGRA1010102BE), 0);
+  EXPECT_EQ(sws_isSupportedOutput(AV_PIX_FMT_BGRA1010102BE), 0);
+  EXPECT_EQ(sws_isSupportedInput(AV_PIX_FMT_RGBA1010102BE), 0);
+  EXPECT_EQ(sws_isSupportedOutput(AV_PIX_FMT_RGBA1010102BE), 0);
+
+  EXPECT_EQ(sws_test_format(AV_PIX_FMT_BGRA1010102BE, 0), 0);
+  EXPECT_EQ(sws_test_format(AV_PIX_FMT_BGRA1010102BE, 1), 0);
+  EXPECT_EQ(sws_test_format(AV_PIX_FMT_RGBA1010102BE, 0), 0);
+  EXPECT_EQ(sws_test_format(AV_PIX_FMT_RGBA1010102BE, 1), 0);
 }
 
 /**
