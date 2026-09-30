@@ -15,6 +15,8 @@
 #include "../tests_common.h"
 
 extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
 #include <libswscale/swscale.h>
@@ -260,6 +262,64 @@ TEST_F(HdrAlpha, TwoBitRoundTripPreservesAlpha) {
     EXPECT_EQ(pixel_at(dst, i * 2) & 0x3, static_cast<std::uint32_t>(i)) << "pixel " << i;
     EXPECT_EQ(pixel_at(dst, i * 2 + 1) & 0x3, static_cast<std::uint32_t>(i)) << "pixel " << i;
   }
+}
+
+/**
+ * @brief The bundled FFmpeg must provide an x265 capable of HEVC Main 10.
+ *
+ * `HdrE2E` only exercises the swscale conversion, so a regression to an
+ * 8-bit-only libx265 would pass there. This test opens the encoder with the
+ * Main 10 profile and 10-bit input, which is what streaming HDR requires.
+ */
+TEST(HdrEncode, Libx265SupportsMain10) {
+  const AVCodec *codec = avcodec_find_encoder_by_name("libx265");
+  ASSERT_NE(codec, nullptr);
+
+  AVCodecContext *ctx = avcodec_alloc_context3(codec);
+  ASSERT_NE(ctx, nullptr);
+  ctx->width = 64;
+  ctx->height = 64;
+  ctx->time_base = { 1, 60 };
+  ctx->framerate = { 60, 1 };
+  ctx->pix_fmt = AV_PIX_FMT_YUV420P10LE;
+  ctx->profile = AV_PROFILE_HEVC_MAIN_10;
+  av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
+  av_opt_set(ctx->priv_data, "x265-params", "rc-lookahead=0:bframes=0", 0);
+
+  ASSERT_EQ(avcodec_open2(ctx, codec, nullptr), 0);
+
+  AVFrame *frame = av_frame_alloc();
+  ASSERT_NE(frame, nullptr);
+  frame->format = ctx->pix_fmt;
+  frame->width = ctx->width;
+  frame->height = ctx->height;
+  ASSERT_EQ(av_frame_get_buffer(frame, 32), 0);
+
+  AVPacket *packet = av_packet_alloc();
+  ASSERT_NE(packet, nullptr);
+
+  int packets = 0;
+  for (int n = 0; n < 16; ++n) {
+    ASSERT_EQ(av_frame_make_writable(frame), 0);
+    for (int y = 0; y < frame->height; ++y) {
+      memset(frame->data[0] + y * frame->linesize[0], 128 + n, frame->linesize[0]);
+    }
+    for (int y = 0; y < frame->height / 2; ++y) {
+      memset(frame->data[1] + y * frame->linesize[1], 128, frame->linesize[1]);
+      memset(frame->data[2] + y * frame->linesize[2], 128, frame->linesize[2]);
+    }
+
+    const int send_ret = avcodec_send_frame(ctx, frame);
+    ASSERT_TRUE(send_ret == 0 || send_ret == AVERROR(EAGAIN)) << "send_frame: " << send_ret;
+    while (avcodec_receive_packet(ctx, packet) == 0) {
+      ++packets;
+    }
+  }
+  EXPECT_GT(packets, 0) << "Main 10 encode produced no packet";
+
+  av_packet_free(&packet);
+  av_frame_free(&frame);
+  avcodec_free_context(&ctx);
 }
 
 /**
