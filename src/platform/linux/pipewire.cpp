@@ -17,6 +17,7 @@
 // local includes
 #include "cuda.h"
 #include "graphics.h"
+#include "pipewire_utils.h"
 #include "src/main.h"
 #include "src/platform/common.h"
 #include "src/video.h"
@@ -50,29 +51,19 @@ namespace {
   constexpr int MAX_PARAMS = 200;
   constexpr int MAX_DMABUF_FORMATS = 200;
   constexpr int MAX_DMABUF_MODIFIERS = 200;
+
+  /**
+   * @brief Budget of one capture reinit after repeated invalid frames.
+   */
+  pipewire::abandoned_stream_budget_t &abandoned_stream_budget() {
+    static pipewire::abandoned_stream_budget_t budget;
+    return budget;
+  }
 }  // namespace
 
 using namespace std::literals;
 
 namespace pipewire {
-  /**
-   * @brief PipeWire SPA format mapped to Sunshine pixel format.
-   */
-  struct format_map_t {
-    uint64_t fourcc;  ///< DRM fourcc pixel format.
-    int32_t pw_format;  ///< Matching PipeWire SPA video format.
-  };
-
-  static constexpr std::array<format_map_t, 7> format_map = {{
-    {DRM_FORMAT_XBGR2101010, SPA_VIDEO_FORMAT_xBGR_210LE},
-    {DRM_FORMAT_BGRA1010102, SPA_VIDEO_FORMAT_ARGB_210LE},
-    {DRM_FORMAT_RGBA1010102, SPA_VIDEO_FORMAT_ABGR_210LE},
-    {DRM_FORMAT_ABGR2101010, SPA_VIDEO_FORMAT_RGBA_102LE},
-    {DRM_FORMAT_ARGB2101010, SPA_VIDEO_FORMAT_BGRA_102LE},
-    {DRM_FORMAT_ARGB8888, SPA_VIDEO_FORMAT_BGRA},
-    {DRM_FORMAT_XRGB8888, SPA_VIDEO_FORMAT_BGRx},
-  }};
-
   /**
    * @brief PipeWire capture state shared with callback threads.
    */
@@ -82,6 +73,8 @@ namespace pipewire {
     std::atomic<int> color_primaries {0};  ///< PipeWire color-primaries metadata for the stream.
     std::atomic<int> transfer_function {0};  ///< PipeWire transfer-function metadata for the stream.
     std::atomic<bool> stream_dead {false};  ///< Whether the PipeWire stream has been destroyed.
+    std::atomic<bool> stream_error {false};  ///< Whether capture was abandoned after repeated invalid frames.
+    drop_burst_t drop_burst;  ///< Drop accounting for frames that could not be used.
     pw_stream_state previous_state;  ///< Previous PipeWire stream state reported by callbacks.
     pw_stream_state current_state;  ///< Current PipeWire stream state reported by callbacks.
     std::string err_msg;  ///< Last PipeWire error message reported by the stream.
@@ -96,7 +89,7 @@ namespace pipewire {
     struct spa_video_info format;  ///< Negotiated PipeWire video format.
     struct pw_buffer *current_buffer;  ///< PipeWire buffer currently exposed to the capture thread.
     uint64_t drm_format;  ///< DRM format.
-    std::shared_ptr<shared_state_t> shared;  ///< State shared between PipeWire callbacks and the capture backend.
+    std::shared_ptr<shared_state_t> shared;  ///< State shared between PipeWire callbacks and the capture backend; always set before the callbacks are registered.
     std::mutex frame_mutex;  ///< Synchronizes access to the current PipeWire frame.
     std::condition_variable frame_cv;  ///< Signals arrival or release of a PipeWire frame.
     size_t local_stride = 0;  ///< Local stride.
@@ -332,51 +325,115 @@ namespace pipewire {
         std::array<uint8_t, SPA_POD_BUFFER_SIZE> buffer;
         struct spa_pod_builder pod_builder = SPA_POD_BUILDER_INIT(buffer.data(), buffer.size());
 
-        int n_params = 0;
         std::array<const struct spa_pod *, MAX_PARAMS> params;
+        const advertised_formats_request_t format_request {
+          .width = width,
+          .height = height,
+          .target_framerate = target_framerate,
+          .dmabuf_infos = dmabuf_infos,
+          .n_dmabuf_infos = n_dmabuf_infos,
+          .mem_type = mem_type,
+          .display_is_nvidia = display_is_nvidia,
+        };
+        const int n_params = append_advertised_formats(pod_builder, params, format_request);
 
-        // Add preferred parameters for DMA-BUF with modifiers
-        // Use DMA-BUF for VAAPI, or for CUDA when the display GPU is NVIDIA (pure NVIDIA system).
-        // On hybrid GPU systems (Intel+NVIDIA), DMA-BUFs come from the Intel GPU and cannot
-        // be imported into CUDA, so we fall back to memory buffers in that case.
-        bool use_dmabuf = n_dmabuf_infos > 0 && (mem_type == platf::mem_type_e::vaapi ||
-                                                 mem_type == platf::mem_type_e::vulkan ||
-                                                 (mem_type == platf::mem_type_e::cuda && display_is_nvidia));
-        if (use_dmabuf) {
-          for (int i = 0; i < n_dmabuf_infos; i++) {
-            auto format_param = build_format_parameter(&pod_builder, width, height, target_framerate, dmabuf_infos[i].format, dmabuf_infos[i].modifiers, dmabuf_infos[i].n_modifiers);
-            params[n_params] = format_param;
-            n_params++;
-          }
+        // Unreachable while the memptr map always advertises the packed BGR
+        // fallbacks (or every format under software conversion). Keep the
+        // teardown as defense in depth so a future encoder path that
+        // advertises nothing cannot leave a half-created stream behind.
+        if (n_params == 0) {
+          BOOST_LOG(error) << "[pipewire] No capture formats could be advertised for the selected encoder path"sv;
+          // Drop the half-created stream so a retry re-negotiates instead of
+          // silently reusing an unconnected stream.
+          pw_stream_destroy(stream_data.stream);
+          stream_data.stream = nullptr;
+          pw_thread_loop_unlock(loop);
+          return -1;
         }
 
-        // Add fallback for memptr
-        for (const auto &fmt : format_map) {
-          auto format_param = build_format_parameter(&pod_builder, width, height, target_framerate, fmt.pw_format, nullptr, 0);
-          params[n_params] = format_param;
-          n_params++;
-        }
-
-        // Connection via pipewire object serial if it is supported and the serial is valid (lower 32-bits != SPA_ID_INVALID, see also PW_KEY_OBJECT_SERIAL docs)
-        if (SUNSHINE_USE_PIPEWIRE_OBJECT_SERIAL && (object_serial & SPA_ID_INVALID) != SPA_ID_INVALID) {
-          pw_properties_setf(props, PW_KEY_TARGET_OBJECT, "%" PRIu64, object_serial);
-          BOOST_LOG(debug) << "[pipewire] Connect PW stream - fd: "sv << fd << " object serial: "sv << object_serial;
-          result = pw_stream_connect(stream_data.stream, PW_DIRECTION_INPUT, PW_ID_ANY, (enum pw_stream_flags)(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS), params.data(), n_params);
-          if (result < 0) {
-            // Unset object serial for retry with node id
-            pw_properties_set(props, PW_KEY_TARGET_OBJECT, nullptr);
-          }
-        } else {
-          result = -1;  // Mark failed so we try to connect via node id
-        }
-        // Connection via legacy (and deprecated) pipewire node id
-        if (result < 0) {
-          BOOST_LOG(debug) << "[pipewire] Connect PW stream - fd: "sv << fd << " node: "sv << node;
-          result = pw_stream_connect(stream_data.stream, PW_DIRECTION_INPUT, node, (enum pw_stream_flags)(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS), params.data(), n_params);
-        }
+        result = connect_stream(props, params, n_params);
       }
 
       pw_thread_loop_unlock(loop);
+      return result;
+    }
+
+    /**
+     * @brief Capture parameters used to choose the advertised SPA formats.
+     */
+    struct advertised_formats_request_t {
+      uint32_t width {};  ///< Frame or display width in pixels.
+      uint32_t height {};  ///< Frame or display height in pixels.
+      AVRational target_framerate {};  ///< Target framerate expressed as AVRational.
+      const struct dmabuf_format_info_t *dmabuf_infos {};  ///< DMA-BUF capture formats offered by the compositor.
+      int n_dmabuf_infos {};  ///< Number of DMA-BUF capture formats.
+      platf::mem_type_e mem_type {};  ///< Encoder memory type selected for the stream.
+      bool display_is_nvidia {};  ///< True when the display GPU is NVIDIA.
+    };
+
+    /**
+     * @brief Fill the SPA parameter list with the formats this encoder path may consume.
+     *
+     * @param pod_builder Builder that owns the generated format pods.
+     * @param params Output parameter list.
+     * @param request Capture parameters used to choose the formats.
+     * @return Number of parameters written.
+     */
+    int append_advertised_formats(struct spa_pod_builder &pod_builder, std::array<const struct spa_pod *, MAX_PARAMS> &params, const advertised_formats_request_t &request) {
+      int n_params = 0;
+
+      // Add preferred parameters for DMA-BUF with modifiers. The hardware VRAM
+      // converters import packed RGB DMA-BUF surfaces, and query_dmabuf_formats()
+      // already filters NV12 out of the list, so skipping it here is defense in depth.
+      if (vram_capture_selected(request.mem_type, request.n_dmabuf_infos > 0, request.display_is_nvidia)) {
+        for (int i = 0; i < request.n_dmabuf_infos; i++) {
+          if (request.dmabuf_infos[i].format == SPA_VIDEO_FORMAT_NV12) {
+            continue;
+          }
+          params[n_params++] = build_format_parameter(&pod_builder, request.width, request.height, request.target_framerate, request.dmabuf_infos[i].format, request.dmabuf_infos[i].modifiers, request.dmabuf_infos[i].n_modifiers);
+        }
+      }
+
+      // Add fallback for memptr. The software conversion path consumes every
+      // declared format, while the hardware paths only accept packed 8-bit BGR.
+      for (const auto &fmt : format_map) {
+        if (!memptr_format_supported(map_spa_pix_fmt(fmt.pw_format), request.mem_type, request.n_dmabuf_infos > 0)) {
+          continue;
+        }
+        params[n_params++] = build_format_parameter(&pod_builder, request.width, request.height, request.target_framerate, fmt.pw_format, nullptr, 0);
+      }
+
+      return n_params;
+    }
+
+    /**
+     * @brief Connect the PipeWire stream through the object serial or node id.
+     *
+     * @param props Stream properties, updated when the object serial is retried.
+     * @param params Advertised SPA parameters.
+     * @param n_params Number of advertised SPA parameters.
+     * @return Connection result; negative on failure.
+     */
+    int connect_stream(struct pw_properties *props, std::array<const struct spa_pod *, MAX_PARAMS> &params, int n_params) {
+      int result = -1;
+
+      // Connection via pipewire object serial if it is supported and the serial is valid (lower 32-bits != SPA_ID_INVALID, see also PW_KEY_OBJECT_SERIAL docs)
+      if (SUNSHINE_USE_PIPEWIRE_OBJECT_SERIAL && (object_serial & SPA_ID_INVALID) != SPA_ID_INVALID) {
+        pw_properties_setf(props, PW_KEY_TARGET_OBJECT, "%" PRIu64, object_serial);
+        BOOST_LOG(debug) << "[pipewire] Connect PW stream - fd: "sv << fd << " object serial: "sv << object_serial;
+        result = pw_stream_connect(stream_data.stream, PW_DIRECTION_INPUT, PW_ID_ANY, (enum pw_stream_flags)(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS), params.data(), n_params);
+        if (result < 0) {
+          // Unset object serial for retry with node id
+          pw_properties_set(props, PW_KEY_TARGET_OBJECT, nullptr);
+        }
+      }
+
+      // Connection via legacy (and deprecated) pipewire node id
+      if (result < 0) {
+        BOOST_LOG(debug) << "[pipewire] Connect PW stream - fd: "sv << fd << " node: "sv << node;
+        result = pw_stream_connect(stream_data.stream, PW_DIRECTION_INPUT, node, (enum pw_stream_flags)(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS), params.data(), n_params);
+      }
+
       return result;
     }
 
@@ -598,6 +655,158 @@ namespace pipewire {
     }
 
     /**
+     * @brief Account for a dropped frame and signal an abandoned stream.
+     *
+     * @param d PipeWire listener data whose shared state tracks the drops.
+     * @return True when the drop should be logged.
+     */
+    static bool report_drop(stream_data_t *d) {
+      const auto update = d->shared->drop_burst.on_drop(std::chrono::steady_clock::now());
+      if (update.abandoned) {
+        {
+          // Update the shared state under the mutex so the capture wait
+          // cannot miss the wakeup.
+          std::scoped_lock lock(d->frame_mutex);
+          d->shared->stream_error.store(true);
+        }
+        d->frame_cv.notify_one();
+      }
+
+      return update.log;
+    }
+
+    /**
+     * @brief Resolve the chroma plane of a PipeWire NV12 memory capture.
+     *
+     * @param b PipeWire buffer being consumed.
+     * @param fmt Negotiated video format.
+     * @param luma_stride Resolved luma row stride in bytes.
+     * @param luma_region Valid luma region.
+     * @param chroma Output chroma plane view.
+     * @return True when the chroma plane was resolved.
+     */
+    static bool resolve_nv12_chroma(const struct pw_buffer *b, const struct spa_video_info_raw &fmt, std::size_t luma_stride, const valid_region_t &luma_region, plane_view_t &chroma) {
+      if (b->buffer->n_datas > 1 && b->buffer->datas[1].data != nullptr) {
+        const auto &chroma_data = b->buffer->datas[1];
+        // A chroma row holds ceil(width / 2) sample pairs, so an odd width
+        // needs one padding byte more than the luma stride.
+        const auto min_chroma_stride = static_cast<std::size_t>(fmt.size.width) + (fmt.size.width & 1);
+        const auto fallback = luma_stride >= min_chroma_stride ? luma_stride : min_chroma_stride;
+        const auto fallback_chroma_stride = contiguous_chroma_stride(fallback);
+        const auto resolved_stride = chroma_data.chunk ? resolve_row_stride(chroma_data.chunk->stride, fallback_chroma_stride) : std::nullopt;
+        if (!resolved_stride) {
+          return false;
+        }
+        const auto chroma_region = resolve_memptr_region(static_cast<const std::uint8_t *>(chroma_data.data), chroma_data.maxsize, chroma_data.chunk->offset, chroma_data.chunk->size, chroma_data.chunk->flags);
+        if (!chroma_region) {
+          return false;
+        }
+        chroma = {chroma_region->data, *resolved_stride, chroma_region->size};
+        return true;
+      }
+
+      if (luma_region.size <= luma_stride * static_cast<std::size_t>(fmt.size.height)) {
+        return false;
+      }
+
+      // Single contiguous block: the chroma plane follows the luma plane. The
+      // size must match that layout exactly, so aligned heights or guessed
+      // strides cannot expose padding as chroma.
+      const auto contiguous = resolve_contiguous_nv12_chroma(luma_region.size, luma_stride, fmt.size.height);
+      if (!contiguous) {
+        return false;
+      }
+      chroma = {luma_region.data + luma_stride * static_cast<std::size_t>(fmt.size.height), contiguous->stride, contiguous->size};
+      return true;
+    }
+
+    /**
+     * @brief Copy an NV12 memory capture into the contiguous converter layout.
+     *
+     * @param d PipeWire listener data receiving the packed frame.
+     * @param b PipeWire buffer being consumed.
+     * @param fmt Negotiated video format.
+     * @param stride Output row pitch of the packed frame.
+     * @return True when the frame was packed.
+     */
+    static bool copy_nv12_memptr_frame(stream_data_t *d, struct pw_buffer *b, const struct spa_video_info_raw &fmt, std::size_t &stride) {
+      const auto &luma_data = b->buffer->datas[0];
+      const auto luma_stride = luma_data.chunk ? resolve_row_stride(luma_data.chunk->stride, static_cast<std::size_t>(fmt.size.width)) : std::nullopt;
+      if (!luma_stride) {
+        return false;
+      }
+      const auto luma_region = resolve_memptr_region(static_cast<const std::uint8_t *>(luma_data.data), luma_data.maxsize, luma_data.chunk->offset, luma_data.chunk->size, luma_data.chunk->flags);
+      if (!luma_region) {
+        return false;
+      }
+
+      plane_view_t chroma {};
+      std::optional<std::size_t> row_pitch;
+      if (resolve_nv12_chroma(b, fmt, *luma_stride, *luma_region, chroma)) {
+        const plane_view_t luma {luma_region->data, *luma_stride, luma_region->size};
+        row_pitch = pack_nv12_memptr_frame(*d->back_buffer, fmt.size.width, fmt.size.height, luma, chroma);
+      }
+
+      if (!row_pitch.has_value()) {
+        if (report_drop(d)) {
+          BOOST_LOG(error) << "[pipewire] Dropping unusable NV12 memory buffer ("sv << fmt.size.width << "x"sv << fmt.size.height << ")"sv;
+        }
+        return false;
+      }
+
+      stride = *row_pitch;
+      return true;
+    }
+
+    /**
+     * @brief Copy a packed 4-byte memory capture into the back buffer.
+     *
+     * @param d PipeWire listener data receiving the frame.
+     * @param data First SPA data plane of the buffer.
+     * @param fmt Negotiated video format.
+     * @param stride Output row stride of the copied frame.
+     * @return True when the frame was copied.
+     */
+    static bool copy_packed_memptr_frame(stream_data_t *d, const struct spa_data &data, const struct spa_video_info_raw &fmt, std::size_t &stride) {
+      if (!data.chunk) {
+        if (report_drop(d)) {
+          BOOST_LOG(error) << "[pipewire] Dropping memory buffer without a chunk description"sv;
+        }
+        return false;
+      }
+
+      const auto resolved_stride = resolve_row_stride(data.chunk->stride, static_cast<std::size_t>(fmt.size.width) * 4);
+      if (!resolved_stride) {
+        if (report_drop(d)) {
+          BOOST_LOG(error) << "[pipewire] Dropping memory buffer with a negative row stride ("sv << data.chunk->stride << ")"sv;
+        }
+        return false;
+      }
+
+      const auto region = resolve_memptr_region(static_cast<const std::uint8_t *>(data.data), data.maxsize, data.chunk->offset, data.chunk->size, data.chunk->flags);
+      if (!region) {
+        if (report_drop(d)) {
+          BOOST_LOG(error) << "[pipewire] Dropping memory buffer with an invalid valid-data region"sv;
+        }
+        return false;
+      }
+
+      if (!packed_memptr_layout_supported(fmt.size.width, fmt.size.height, *resolved_stride, region->size)) {
+        if (report_drop(d)) {
+          BOOST_LOG(error) << "[pipewire] Dropping memory buffer with an unusable packed layout (stride "sv << *resolved_stride << ", "sv << region->size << " valid bytes, "sv << fmt.size.width << "x"sv << fmt.size.height << ")"sv;
+        }
+        return false;
+      }
+
+      stride = *resolved_stride;
+      if (d->back_buffer->size() < region->size) {
+        d->back_buffer->resize(region->size);
+      }
+      std::memcpy(d->back_buffer->data(), region->data, region->size);
+      return true;
+    }
+
+    /**
      * @brief Copy PipeWire metadata into the Sunshine image descriptor.
      *
      * @param img_descriptor Image descriptor receiving timestamps, sequence, and damage flags.
@@ -620,7 +829,7 @@ namespace pipewire {
                                           std::chrono::steady_clock::time_point(std::chrono::nanoseconds(img_descriptor->pts.value())) :
                                           std::chrono::steady_clock::now();
 
-      if (buf->n_datas > 0) {
+      if (buf->n_datas > 0 && buf->datas[0].chunk) {
         img_descriptor->pw_flags = buf->datas[0].chunk->flags;
       }
 
@@ -636,8 +845,18 @@ namespace pipewire {
      * @param img_descriptor Image descriptor receiving duplicated fds and plane layout.
      * @param buf Raw byte buffer used for serialization.
      * @param d PipeWire listener data passed to the callback.
+     * @return True when the descriptor was filled; false when plane metadata is missing.
      */
-    static void fill_img_dmabuf(egl::img_descriptor_t *img_descriptor, struct spa_buffer *buf, const stream_data_t &d) {
+    static bool fill_img_dmabuf(egl::img_descriptor_t *img_descriptor, struct spa_buffer *buf, const stream_data_t &d) {
+      // Every plane needs chunk metadata for its stride and offset. Validate the
+      // whole buffer first so a malformed frame cannot leak duplicated fds.
+      for (int i = 0; i < MIN(buf->n_datas, 4); i++) {
+        if (!buf->datas[i].chunk) {
+          BOOST_LOG(error) << "[pipewire] DMA-BUF plane "sv << i << " has no chunk metadata"sv;
+          return false;
+        }
+      }
+
       img_descriptor->sd.width = d.format.info.raw.size.width;
       img_descriptor->sd.height = d.format.info.raw.size.height;
       img_descriptor->sd.modifier = d.format.info.raw.modifier;
@@ -647,6 +866,8 @@ namespace pipewire {
         img_descriptor->sd.pitches[i] = buf->datas[i].chunk->stride;
         img_descriptor->sd.offsets[i] = buf->datas[i].chunk->offset;
       }
+      img_descriptor->pixel_format = map_spa_pix_fmt(d.format.info.raw.format);
+      return true;
     }
 
     /**
@@ -672,11 +893,28 @@ namespace pipewire {
       }
 
       struct spa_buffer *buf = stream_data.current_buffer->buffer;
+      if (!buf || buf->n_datas == 0 || !buf->datas[0].chunk) {
+        if (report_drop(&stream_data)) {
+          BOOST_LOG(error) << "[pipewire] Dropping a buffer without chunk metadata"sv;
+        }
+        img->data = nullptr;
+        close_img_fds(static_cast<egl::img_descriptor_t *>(img));
+        pw_thread_loop_unlock(loop);
+        return;
+      }
+
       if (buf->datas[0].chunk->size != 0) {
         auto *img_descriptor = static_cast<img_descriptor_t *>(img);
         fill_img_metadata(img_descriptor, buf);
         if (buf->datas[0].type == SPA_DATA_DmaBuf) {
-          fill_img_dmabuf(img_descriptor, buf, stream_data);
+          if (!fill_img_dmabuf(img_descriptor, buf, stream_data)) {
+            report_drop(&stream_data);
+            img->data = nullptr;
+            close_img_fds(img_descriptor);
+          } else {
+            // A complete DMA-BUF frame proves the stream recovered.
+            stream_data.shared->drop_burst.on_recovered();
+          }
         } else {
           img->data = stream_data.front_buffer->data();
           img_descriptor->data_owned = false;
@@ -684,6 +922,7 @@ namespace pipewire {
           // NV12 is the only 1-byte-per-pixel format delivered on the memory
           // path; every other negotiated format is packed 4 bytes per pixel.
           img->pixel_pitch = (stream_data.format.info.raw.format == SPA_VIDEO_FORMAT_NV12) ? 1 : 4;
+          img->pixel_format = map_spa_pix_fmt(stream_data.format.info.raw.format);
         }
       }
 
@@ -789,7 +1028,7 @@ namespace pipewire {
 
       switch (state) {
         case PW_STREAM_STATE_PAUSED:
-          if (d->shared && old == PW_STREAM_STATE_STREAMING) {
+          if (old == PW_STREAM_STATE_STREAMING) {
             {
               std::scoped_lock lock(d->frame_mutex);
               d->frame_ready = false;
@@ -811,10 +1050,8 @@ namespace pipewire {
           }
           [[fallthrough]];
         case PW_STREAM_STATE_UNCONNECTED:
-          if (d->shared) {
-            d->shared->stream_dead.store(true);
-            d->frame_cv.notify_all();
-          }
+          d->shared->stream_dead.store(true);
+          d->frame_cv.notify_all();
           break;
         default:
           break;
@@ -837,6 +1074,24 @@ namespace pipewire {
         return;
       }
 
+      if (b->buffer->n_datas == 0) {
+        if (report_drop(d)) {
+          BOOST_LOG(error) << "[pipewire] Dropping a buffer without any data plane"sv;
+        }
+        pw_stream_queue_buffer(d->stream, b);
+        d->frame_cv.notify_one();
+        return;
+      }
+
+      const auto &first_plane = b->buffer->datas[0];
+      if (first_plane.chunk && (first_plane.chunk->size == 0 || (first_plane.chunk->flags & SPA_CHUNK_FLAG_EMPTY) != 0)) {
+        // An empty buffer announces that nothing new is available, for example
+        // during cursor-only updates. Return it without spending the drop
+        // budget so a static desktop cannot abandon a healthy stream.
+        pw_stream_queue_buffer(d->stream, b);
+        return;
+      }
+
       // 2. Fast Path: DMA-BUF
       if (b->buffer->datas[0].type == SPA_DATA_DmaBuf) {
         std::scoped_lock lock(d->frame_mutex);
@@ -848,20 +1103,37 @@ namespace pipewire {
       }
       // 3. Optimized Path: Software/MemPtr
       else if (b->buffer->datas[0].data != nullptr) {
-        size_t size = b->buffer->datas[0].chunk->size;
-
-        // Perform the copy to the BACK buffer while NOT holding the lock
-        if (d->back_buffer->size() < size) {
-          d->back_buffer->resize(size);
+        const auto &fmt = d->format.info.raw;
+        if (fmt.size.width <= 0 || fmt.size.height <= 0) {
+          if (report_drop(d)) {
+            BOOST_LOG(error) << "[pipewire] Dropping memory buffer with invalid dimensions"sv;
+          }
+          // Return the buffer to PipeWire and drop the frame.
+          pw_stream_queue_buffer(d->stream, b);
+          d->frame_cv.notify_one();
+          return;
         }
-        std::memcpy(d->back_buffer->data(), b->buffer->datas[0].data, size);
+
+        std::size_t stride = 0;
+        const bool copied = fmt.format == SPA_VIDEO_FORMAT_NV12 ?
+                              copy_nv12_memptr_frame(d, b, fmt, stride) :
+                              copy_packed_memptr_frame(d, b->buffer->datas[0], fmt, stride);
+
+        if (!copied) {
+          // Return the buffer to PipeWire and drop the frame.
+          pw_stream_queue_buffer(d->stream, b);
+          d->frame_cv.notify_one();
+          return;
+        }
+
+        d->shared->drop_burst.on_recovered();
 
         {
           // Lock only for the pointer swap and state update
           std::scoped_lock lock(d->frame_mutex);
           std::swap(d->front_buffer, d->back_buffer);
 
-          d->local_stride = b->buffer->datas[0].chunk->stride;
+          d->local_stride = stride;
           d->frame_ready = true;
           d->current_buffer = b;
         }
@@ -881,6 +1153,10 @@ namespace pipewire {
       if (param == nullptr || id != SPA_PARAM_Format) {
         return;
       }
+
+      // A renegotiated format restarts the drop accounting.
+      d->shared->drop_burst.on_recovered();
+
       if (spa_format_parse(param, &d->format.media_type, &d->format.media_subtype) < 0) {
         return;
       }
@@ -906,7 +1182,7 @@ namespace pipewire {
       int physical_w = d->format.info.raw.size.width;
       int physical_h = d->format.info.raw.size.height;
 
-      if (d->shared) {
+      {
         int old_w = d->shared->negotiated_width.load();
         int old_h = d->shared->negotiated_height.load();
         int old_color_primaries = d->shared->color_primaries.load();
@@ -1096,6 +1372,8 @@ namespace pipewire {
         shared_state = std::make_shared<shared_state_t>();
       } else {
         shared_state->stream_dead.store(false);
+        shared_state->stream_error.store(false);
+        shared_state->drop_burst.on_recovered();
         shared_state->negotiated_width.store(0);
         shared_state->negotiated_height.store(0);
         shared_state->color_primaries.store(0);
@@ -1164,6 +1442,11 @@ namespace pipewire {
           return platf::capture_e::timeout;
         }
 
+        // Abandon the stream promptly once repeated invalid frames gave up.
+        if (shared_state->stream_error.load()) {
+          return platf::capture_e::capture_error;
+        }
+
         if (!pull_free_image_cb(img_out)) {
           return platf::capture_e::interrupted;
         }
@@ -1174,6 +1457,10 @@ namespace pipewire {
 
         // Check if we got valid data (either DMA-BUF fd or memory pointer), then filter duplicates
         if ((img_egl->sd.fds[0] >= 0 || img_egl->data != nullptr) && !is_buffer_redundant(img_egl)) {
+          // A valid frame proves the stream recovered, so a future abandonment
+          // may reinitialize capture once more.
+          abandoned_stream_budget().on_recovered();
+
           // Update frame metadata
           update_metadata(img_egl, retries);
           return platf::capture_e::ok;
@@ -1198,6 +1485,7 @@ namespace pipewire {
       img->height = height;
       img->pixel_pitch = 4;
       img->row_pitch = img->pixel_pitch * width;
+      img->pixel_format = platf::pix_fmt_e::bgr0;
       img->sequence = 0;
       img->serial = std::numeric_limits<decltype(img->serial)>::max();
       img->data = nullptr;
@@ -1251,6 +1539,12 @@ namespace pipewire {
           return reinit;
         }
 
+        // Abandon the stream when the producer keeps delivering invalid frames,
+        // but try one reinit first to renegotiate the capture.
+        if (const auto abandoned_status = abandoned_stream_status()) {
+          return *abandoned_status;
+        }
+
         // Use unpaced event driven capture when possible
         if (pacing_required) {
           platf::handle_pacing(next_frame, delay, sleep_overshoot_logger);
@@ -1259,10 +1553,12 @@ namespace pipewire {
         std::shared_ptr<platf::img_t> img_out;
         switch (const auto status = snapshot(pull_free_image_cb, img_out, 1000ms, *cursor)) {
           case reinit:
-          case capture_error:
           case interrupted:
             pipewire.frame_cv().notify_all();
             return status;
+          case capture_error:
+            pipewire.frame_cv().notify_all();
+            return abandoned_stream_status().value_or(status);
           case timeout:
             if (!pull_free_image_cb(img_out)) {
               // Detect if shutdown is pending
@@ -1291,27 +1587,53 @@ namespace pipewire {
     }
 
     /**
+     * @brief Turn an abandoned-stream signal into a capture status.
+     *
+     * @return Reinit for the first abandonment, error for the next one, or
+     * empty when the stream was not abandoned.
+     */
+    std::optional<platf::capture_e> abandoned_stream_status() {
+      if (!shared_state->stream_error.exchange(false)) {
+        return std::nullopt;
+      }
+
+      if (abandoned_stream_budget().consume_reinit()) {
+        BOOST_LOG(warning) << "[pipewire] Repeated invalid memory buffers; reinitializing capture once"sv;
+        return platf::capture_e::reinit;
+      }
+
+      BOOST_LOG(error) << "[pipewire] Aborting capture after repeated invalid memory buffers"sv;
+      // The capture session ends here, so let the next session use its own
+      // retry budget instead of keeping the whole process in abort mode.
+      abandoned_stream_budget().on_aborted();
+      return platf::capture_e::capture_error;
+    }
+
+    /**
      * @brief Create AVCodec encode device.
      *
      * @param pix_fmt Sunshine pixel format to convert or allocate for.
      * @return Constructed AVCodec encode device object.
      */
     std::unique_ptr<platf::avcodec_encode_device_t> make_avcodec_encode_device(platf::pix_fmt_e pix_fmt) override {
+      const bool has_dmabuf_capture = n_dmabuf_infos > 0;
+      const bool vram_capture = vram_capture_selected(mem_type, has_dmabuf_capture, display_is_nvidia);
+
 #ifdef SUNSHINE_BUILD_VAAPI
       if (mem_type == platf::mem_type_e::vaapi) {
-        return va::make_avcodec_encode_device(width, height, n_dmabuf_infos > 0);
+        return va::make_avcodec_encode_device(width, height, vram_capture);
       }
 #endif
 
 #ifdef SUNSHINE_BUILD_VULKAN
-      if (mem_type == platf::mem_type_e::vulkan && n_dmabuf_infos > 0) {
+      if (mem_type == platf::mem_type_e::vulkan && vram_capture) {
         return vk::make_avcodec_encode_device_vram(width, height, 0, 0);
       }
 #endif
 
 #ifdef SUNSHINE_BUILD_CUDA
       if (mem_type == platf::mem_type_e::cuda) {
-        if (display_is_nvidia && n_dmabuf_infos > 0) {
+        if (vram_capture) {
           // Display GPU is NVIDIA - can use DMA-BUF directly
           return cuda::make_avcodec_gl_encode_device(width, height, 0, 0);
         } else {
@@ -1344,6 +1666,7 @@ namespace pipewire {
           static_cast<img_descriptor_t *>(img)->data_owned = true;
           img->row_pitch = w * 4;
           img->pixel_pitch = 4;
+          img->pixel_format = platf::pix_fmt_e::bgr0;
         }
       }
       return 0;
@@ -1430,7 +1753,7 @@ namespace pipewire {
       std::unique_lock<std::mutex> lock(pipewire.frame_mutex());
 
       bool success = pipewire.frame_cv().wait_until(lock, deadline, [&] {
-        return pipewire.is_frame_ready() || shared_state->stream_dead.load();
+        return pipewire.is_frame_ready() || shared_state->stream_dead.load() || shared_state->stream_error.load();
       });
 
       if (success) {
@@ -1461,6 +1784,13 @@ namespace pipewire {
       for (const auto &fmt : format_map) {
         if (n_dmabuf_infos >= MAX_DMABUF_FORMATS) {
           break;
+        }
+
+        // NV12 never gets advertised as a DMA-BUF capture format (the VRAM
+        // converters import packed RGB surfaces only), so it must not count
+        // towards the DMA-BUF availability used for device selection.
+        if (fmt.pw_format == SPA_VIDEO_FORMAT_NV12) {
+          continue;
         }
 
         if (!pw_format_supported(fmt.fourcc, dmabuf_formats)) {
