@@ -638,6 +638,7 @@ namespace wl {
       img->height = height;
       img->pixel_pitch = 4;
       img->row_pitch = img->pixel_pitch * width;
+      img->pixel_format = platf::pix_fmt_e::bgr0;
       img->data = new std::uint8_t[height * img->row_pitch];
 
       return img;
@@ -702,6 +703,8 @@ namespace wl {
       img->sequence = 0;
       img->serial = std::numeric_limits<decltype(img->serial)>::max();
       img->data = nullptr;
+      img->pixel_pitch = 4;
+      img->pixel_format = platf::pix_fmt_e::bgr0;
 
       // File descriptors aren't open
       img->sd.fds.fill(-1);
